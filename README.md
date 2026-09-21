@@ -1,4 +1,4 @@
-# docrot
+# Doc Rot Crawler
 
 Documentation rot detector: executes a project's docs against its real code,
 across releases, and shows where they disagree.
