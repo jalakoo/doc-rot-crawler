@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scans · Doc Rot Crawler</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="shell">
+
+  <!-- =============================================================== LIST -->
+  <div class="view" id="viewList">
+
+    <header class="panel masthead">
+      <div style="flex:1 1 380px">
+        <h1>DOC ROT CRAWLER</h1>
+        <p class="sub">Every docs site you watch, checked against the code it describes &mdash; <b>and how much of it has rotted</b> since the last scan.</p>
+      </div>
+      <dl class="ribbon" id="fleetRibbon" style="flex:1 1 420px"></dl>
+    </header>
+
+    <p class="banner" id="offline" role="alert" hidden>Can't reach the docrot server. Is <b>docrot serve</b> still running? Retrying&hellip;</p>
+
+    <section class="panel">
+      <h2 class="panel-hd">Scans <span class="hd-note" id="scanCount"></span></h2>
+      <div class="panel-bd">
+        <div class="toolbar">
+          <p>Open a scan to see its drift, or click <b>&#9998;</b> to rename it.</p>
+          <span class="toolbar-actions">
+            <button class="btn-ghost" type="button" data-import>Import</button>
+            <button class="btn-torch" type="button" data-new>+ New scan</button>
+          </span>
+        </div>
+        <p class="empty" id="empty" hidden>No scans yet. Add one here, or run
+          <code>docrot scan --docs-url URL --repo URL</code> and it will appear.</p>
+        <ul class="cards" id="cards"></ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-bd legend">
+        <span class="lg u" style="color:var(--bone-dim)">Each square in a card is one page:</span>
+        <span class="lg f"><i class="swatch"></i>Docs and code disagree</span>
+        <span class="lg d"><i class="swatch"></i>Version pin out of date</span>
+        <span class="lg b"><i class="swatch"></i>Never ran &mdash; blocked upstream</span>
+        <span class="lg p"><i class="swatch"></i>No drift found</span>
+        <span class="lg u"><i class="swatch"></i>Prose only &mdash; nothing to check</span>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ============================================================= DETAIL -->
+  <div class="view" id="viewDetail" hidden>
+
+    <nav class="panel crumbs" aria-label="Scan">
+      <a class="back" href="#/">&#9664; All scans</a>
+      <h2 class="crumb-name" id="crumbName" tabindex="-1"></h2>
+      <span class="crumb-run" id="crumbRun"></span>
+      <a class="btn-ghost" id="exportLink" href="#" download hidden
+         title="This run as JSON Lines, for AI agents and scripts">Export JSONL</a>
+      <a class="btn-ghost" id="exportSarif" href="#" download hidden
+         title="This run as SARIF 2.1.0, for CI and code scanning">SARIF</a>
+      <button class="btn-ghost" type="button" id="rerun">Re-run</button>
+    </nav>
+
+    <header class="panel masthead">
+      <div style="flex:1 1 380px">
+        <h1>DOC ROT CRAWLER</h1>
+        <p class="sub" id="sub"></p>
+      </div>
+      <dl class="ribbon" id="ribbon" style="flex:1 1 420px"></dl>
+    </header>
+
+    <section class="panel notice" id="notice" hidden>
+      <h2 class="panel-hd"><span id="noticeHd"></span><span class="hd-note" id="noticeNote"></span></h2>
+      <div class="panel-bd">
+        <p class="notice-title" id="noticeTitle"></p>
+        <div id="noticePhases"></div>
+        <p class="find-desc" id="noticeDesc"></p>
+      </div>
+      <div class="log" id="liveLog" tabindex="0"></div>
+    </section>
+
+    <div class="view" id="reportBody">
+      <!-- the original single-report page, plus a Sources panel -->
+      <div class="board">
+        <div class="col">
+
+          <section class="panel">
+            <h2 class="panel-hd">Drift detail <span class="hd-note" id="where"></span></h2>
+            <div class="panel-bd">
+
+              <div class="findnav">
+                <button class="step" id="prev" type="button" aria-label="Previous finding on this page">&#9664;</button>
+                <span class="counter" id="counter" aria-live="polite"></span>
+                <button class="step" id="next" type="button" aria-label="Next finding on this page">&#9654;</button>
+                <ul class="find-list" id="findList"></ul>
+                <span class="kbd-hint"><kbd>&#8592;</kbd> <kbd>&#8594;</kbd> to cycle</span>
+              </div>
+
+              <div class="duel">
+                <div class="side docs">
+                  <p class="side-hd">Docs say</p>
+                  <pre class="slab" id="docSlab"></pre>
+                  <a class="src-link" id="docLink" href="#" target="_blank" rel="noopener noreferrer">
+                    <span class="where" id="docWhere"></span><span class="go">open &#8599;</span>
+                  </a>
+                  <p class="stamp"><span id="docStampLbl">docs reflect</span><b id="docStamp"></b></p>
+                </div>
+
+                <div class="versus">
+                  <canvas id="portrait" width="19" height="19" role="img" aria-label="Illustration of the drift type"></canvas>
+                  <span class="vs-word">VS</span>
+                  <p class="damage" id="damage"></p>
+                </div>
+
+                <div class="side code">
+                  <p class="side-hd">Code does</p>
+                  <pre class="slab" id="codeSlab"></pre>
+                  <a class="src-link" id="codeLink" href="#" target="_blank" rel="noopener noreferrer">
+                    <span class="where" id="codeWhere"></span><span class="go">open &#8599;</span>
+                  </a>
+                  <p class="stamp"><span id="codeStampLbl">code is at</span><b id="codeStamp"></b></p>
+                </div>
+              </div>
+
+              <div class="meter">
+                <p class="meter-lbl">
+                  <span>How far behind the docs are</span>
+                  <span class="big" id="gapBig"></span>
+                </p>
+                <div class="segs" id="segs" role="img" aria-label="Staleness meter"></div>
+                <p class="meter-scale"><span>same day</span><span>30 days &mdash; still fresh</span><span>168+</span></p>
+              </div>
+
+              <div class="meta">
+                <p class="find-title" id="findTitle"></p>
+                <p class="find-desc" id="findDesc"></p>
+                <ul class="chips" id="chips"></ul>
+                <pre class="evidence" id="evidence"></pre>
+              </div>
+
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2 class="panel-hd">Scan log <span class="hd-note" id="runStamp"></span></h2>
+            <div class="log" id="log" tabindex="0"></div>
+          </section>
+
+        </div>
+
+        <div class="col">
+          <section class="panel"><div class="strip" id="strip"></div></section>
+
+          <section class="panel sources">
+            <h2 class="panel-hd">Sources <span class="hd-note">pages from each</span></h2>
+            <div class="panel-bd"><ul class="srcs-list" id="sources"></ul></div>
+          </section>
+
+          <section class="panel">
+            <h2 class="panel-hd">Docs site map <span class="hd-note">each tile is one page</span></h2>
+            <div class="panel-bd" id="map"></div>
+          </section>
+
+          <section class="panel">
+            <h2 class="panel-hd">Rename impact</h2>
+            <div class="panel-bd impact">
+              <label for="sym">If I rename this symbol, what breaks?</label>
+              <div class="impact-row">
+                <input id="sym" type="text" spellcheck="false" placeholder="symbol name&hellip;" aria-describedby="impactHint">
+                <button id="check" type="button">Check</button>
+              </div>
+              <div class="impact-out" id="impactOut"></div>
+              <p class="impact-hint" id="impactHint"></p>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <section class="panel">
+        <h2 class="panel-hd">Release timeline <span class="hd-note">when each page stopped being true</span></h2>
+        <div class="panel-bd">
+          <div class="tl-scroll"><div class="tl">
+            <div class="tl-body" id="tlBody"></div>
+          </div></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-bd legend">
+          <span class="lg f"><i class="swatch"></i>Docs and code disagree</span>
+          <span class="lg d"><i class="swatch"></i>Version pin out of date</span>
+          <span class="lg b"><i class="swatch"></i>Never ran &mdash; blocked upstream</span>
+          <span class="lg p"><i class="swatch"></i>No drift found</span>
+          <span class="lg u"><i class="swatch"></i>Prose only &mdash; nothing to check</span>
+        </div>
+      </section>
+    </div>
+
+    <footer id="foot"></footer>
+  </div>
+</div>
+
+<!-- ========================================================= NEW SCAN -->
+<dialog class="panel dlg" id="dlg" aria-labelledby="dlgTitle">
+  <form id="scanForm" novalidate>
+    <h2 class="panel-hd"><span id="dlgTitle">New scan</span><span class="hd-note">docs + the code they describe</span></h2>
+    <div class="panel-bd form">
+
+      <div class="field">
+        <label for="fName">Name</label>
+        <input class="inp" id="fName" type="text" maxlength="60" spellcheck="false" autocomplete="off" placeholder="e.g. Payments SDK">
+        <p class="hint">Optional. Defaults to the first docs site. You can rename it later.</p>
+      </div>
+
+      <fieldset class="field docs">
+        <legend>Docs sites</legend>
+        <ol class="src-rows" id="docsRows"></ol>
+        <button class="add-row" type="button" data-add="docs">+ Add another docs URL</button>
+      </fieldset>
+
+      <fieldset class="field code">
+        <legend>Repositories</legend>
+        <ol class="src-rows" id="repoRows"></ol>
+        <button class="add-row" type="button" data-add="repo">+ Add another repo</button>
+        <p class="hint">Git URL or local path. Every docs site is checked against the symbols of <b>every</b> repo listed.
+          Paste several at once &mdash; one per line.</p>
+      </fieldset>
+
+      <details class="opts">
+        <summary>Scan options</summary>
+        <div class="opt-grid">
+          <div class="opt">
+            <label for="fEco">Ecosystem</label>
+            <select class="inp" id="fEco"><option value="pypi">PyPI</option><option value="npm">npm</option></select>
+          </div>
+          <div class="opt">
+            <label for="fVers">Releases to test</label>
+            <input class="inp" id="fVers" type="number" min="1" max="10" value="3">
+          </div>
+          <div class="opt">
+            <label for="fMax">Max pages per site</label>
+            <input class="inp" id="fMax" type="number" min="1" max="2000" placeholder="60">
+          </div>
+          <label class="check"><input id="fCred" type="checkbox">
+            <span><b>Snippets need no credentials.</b> Run them for real instead of only probing symbols &mdash;
+              right for targets like Streamlit, wrong for anything that calls a paid API.</span></label>
+        </div>
+      </details>
+
+      <p class="form-err" id="formErr" role="alert"></p>
+
+      <div class="form-actions">
+        <p class="hint">Runs in Daytona sandboxes, ~2 min.</p>
+        <button class="btn-ghost" type="button" id="cancel">Cancel</button>
+        <button class="btn-torch" type="submit" id="submitScan">Start scan</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<!-- ========================================================== IMPORT -->
+<dialog class="panel dlg" id="importDlg" aria-labelledby="importTitle">
+  <form id="importForm" novalidate>
+    <h2 class="panel-hd"><span id="importTitle">Import a run</span><span class="hd-note">JSON Lines or SARIF</span></h2>
+    <div class="panel-bd form">
+
+      <div class="field">
+        <label for="fFile">Exported file</label>
+        <input class="inp" id="fFile" type="file" accept=".jsonl,.ndjson,.sarif,.json">
+        <p class="hint">A <b>findings.jsonl</b> or <b>.sarif</b> file written by <b>docrot export</b>,
+          from this machine or someone else's. Nothing is re-verified &mdash; the run is shown as it
+          was exported, and pages without findings are missing unless the file was exported with
+          <b>--include-clean</b>.</p>
+      </div>
+
+      <div class="field">
+        <label for="fImportName">Name</label>
+        <input class="inp" id="fImportName" type="text" maxlength="60" spellcheck="false"
+               autocomplete="off" placeholder="defaults to the name in the file">
+        <p class="hint">If the file's docs and repos match a scan you already have, the run joins
+          that scan's history instead of starting a new one.</p>
+      </div>
+
+      <p class="form-err" id="importErr" role="alert"></p>
+
+      <div class="form-actions">
+        <button class="btn-ghost" type="button" id="importCancel">Cancel</button>
+        <button class="btn-torch" type="submit" id="importSubmit">Import</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<p class="sr-only" id="live" aria-live="polite"></p>
+<script src="lib.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

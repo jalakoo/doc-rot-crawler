@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/cache/
+# Scan output is rebuildable by running the app, and specific to whoever ran it
+data/runs/
+*.egg-info/
+.pytest_cache/
+node_modules/
+data/scans/
+.coverage
+htmlcov/
+test-results/
+.mypy_cache/
+.ruff_cache/
+# Spike measurement output: ~1 MB of results containing scraped doc snippets
+spikes/out/

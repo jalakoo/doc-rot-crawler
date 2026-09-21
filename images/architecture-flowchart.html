@@ -1,0 +1,236 @@
+<!doctype html>
+<!-- Source for images/architecture-flowchart.png: the README's mermaid flowchart,
+     drawn dungeon-style. Same nodes, same edges, same direction. Node boxes are
+     positioned absolutely on a 1700x1300 canvas and the SVG underneath draws the
+     edges between those coordinates, so moving a box means moving its path too.
+     Regenerate with images/render.py. -->
+<html lang="en"><head><meta charset="utf-8">
+<title>docrot flowchart</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=block">
+<style>
+  :root {
+    --shadow:#0d0a14; --stone:#1a1426; --edge:#413060;
+    --torch:#f0a830; --torch-hot:#ffd257; --bone:#e8dfc8; --dim:#9a8f7d;
+    --rune:#6ec3d9; --blood:#d92b39; --moss:#4f9d5d;
+    --display:"Press Start 2P",monospace; --body:"VT323",monospace;
+  }
+  * { box-sizing:border-box; margin:0; padding:0 }
+  body {
+    width:1700px; height:1300px; position:relative; overflow:hidden;
+    background:var(--shadow);
+    background-image:radial-gradient(ellipse 110% 60% at 50% 0%, #241a33 0%, #0d0a14 72%);
+    color:var(--bone); font-family:var(--body); font-size:20px;
+  }
+  svg.wires { position:absolute; inset:0; width:1700px; height:1300px; z-index:0 }
+
+  .n { position:absolute; z-index:1; background:var(--stone); border:2px solid var(--edge);
+       padding:9px 13px; display:flex; flex-direction:column; gap:3px; justify-content:center;
+       box-shadow:inset 0 3px 0 0 #3a2b56, inset 0 -3px 0 0 #100c1a }
+  .n .name { font-family:var(--display); font-size:11px; color:var(--bone); line-height:1.4 }
+  .n .note { font-size:18px; color:var(--dim); line-height:1.25 }
+  .n.serve { position:absolute }
+  .n .note b { color:var(--bone); font-weight:400 }
+
+  /* a dashed room the boxes sit inside, like a mermaid subgraph */
+  .group { position:absolute; z-index:0; border:2px dashed var(--edge); background:rgba(26,20,38,.45) }
+  .group .tag { position:absolute; top:-13px; left:18px; background:var(--shadow);
+                padding:0 9px; font-family:var(--display); font-size:10px; color:var(--dim) }
+
+  .phase { border-color:var(--edge) }
+  .phase .num { position:absolute; left:-1px; top:-1px; font-family:var(--display); font-size:11px;
+                color:var(--shadow); background:var(--torch); padding:6px 7px 5px }
+  .phase .name { color:var(--torch-hot); padding-left:34px }
+  .phase .note { padding-left:34px }
+
+  .serve { border-width:3px; border-color:var(--torch) }
+  .serve .name { color:var(--torch) }
+  /* everything the scan has to leave the process to reach */
+  .ext { border-width:3px; border-color:var(--rune); background:#120e1c }
+  .ext .name { color:var(--rune) }
+  .ext .via { font-size:17px; color:var(--torch) }
+  .ext.none { border-color:var(--edge); opacity:.5 }
+  .ext.none .name { color:var(--dim) }
+  .store { border-width:3px; border-color:var(--rune); border-radius:0 }
+  .store .name { color:var(--rune) }
+  .out { border-width:3px; border-color:var(--torch) }
+  .out .name { color:var(--torch) }
+
+  h1 { position:absolute; left:40px; top:24px; z-index:1; font-family:var(--display);
+       font-size:19px; color:var(--torch-hot);
+       text-shadow:0 3px 0 #7a4a08, 0 5px 0 var(--shadow) }
+  .lede { position:absolute; left:250px; top:30px; z-index:1; font-size:21px; color:var(--dim) }
+  .lede b { color:var(--bone); font-weight:400 }
+
+  .legend { position:absolute; z-index:1; border:2px solid var(--edge); background:var(--stone);
+            padding:12px 15px; display:flex; flex-direction:column; gap:7px }
+  .legend .name { font-family:var(--display); font-size:10px; color:var(--dim) }
+  .legend .row { display:flex; align-items:center; gap:9px; font-size:18px; color:var(--dim) }
+  .swatch { width:15px; height:15px; border:3px solid var(--edge); flex:none }
+  .swatch.torch { border-color:var(--torch) } .swatch.rune { border-color:var(--rune) }
+</style></head>
+<body>
+  <h1>DOCROT</h1>
+  <p class="lede">one scan, start to finish &mdash; and every wire that
+    <b>leaves this process</b></p>
+
+  <svg class="wires" viewBox="0 0 1700 1300" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+              orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6b5495"/>
+      </marker>
+      <marker id="tip-rune" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+              orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6ec3d9"/>
+      </marker>
+    </defs>
+    <g fill="none" stroke="#6b5495" stroke-width="3" marker-end="url(#tip)">
+      <!-- in through the API and the queue, or straight in from the CLI -->
+      <path d="M360,141 H404 V168 H440"/>
+      <path d="M770,272 V300 H400 V366"/>
+      <path d="M200,264 V366"/>
+      <!-- the chain itself -->
+      <path d="M310,448 V486"/>
+      <path d="M310,568 V606"/>
+      <path d="M310,688 V726"/>
+      <path d="M310,808 V846"/>
+      <path d="M310,928 V966"/>
+      <!-- what the run leaves behind -->
+      <path d="M310,1048 V1124"/>
+      <path d="M620,1185 H694"/>
+      <path d="M1146,1185 H1214"/>
+    </g>
+    <g fill="none" stroke="#6ec3d9" stroke-width="3" marker-end="url(#tip-rune)">
+      <!-- every hop off this machine -->
+      <path d="M560,392 H694"/>
+      <path d="M560,424 H636 V524 H694"/>
+      <path d="M560,530 H636 V616 H694"/>
+      <path d="M560,650 H636 V720 H694"/>
+      <path d="M560,770 H636 V830 H694"/>
+      <path d="M560,890 H636 V934 H694"/>
+    </g>
+    <!-- a saved run, read back in and compared against the next one -->
+    <path d="M926,1130 V1100 H1648 V306 H1206 V200 H1126" fill="none" stroke="#6b5495"
+          stroke-width="3" stroke-dasharray="9 7" marker-end="url(#tip)"/>
+    <text x="1236" y="296" font-family="VT323, monospace" font-size="19" fill="#9a8f7d">
+      a run, imported back in
+    </text>
+  </svg>
+
+  <!-- ENTER: the two ways a scan starts -->
+  <div class="n" style="left:40px; top:100px; width:320px; height:82px">
+    <span class="name">DASHBOARD</span>
+    <span class="note">in the browser &middot; no build step &middot; polls the API</span>
+  </div>
+  <div class="n" style="left:40px; top:200px; width:320px; height:64px">
+    <span class="name">DOCROT CLI</span>
+    <span class="note">scan &middot; scans &middot; diff &middot; blast &middot; export</span>
+  </div>
+
+  <div class="group" style="left:420px; top:76px; width:706px; height:212px">
+    <span class="tag">DOCROT SERVE &middot; 127.0.0.1 &middot; FASTAPI</span>
+  </div>
+  <div class="n serve" style="left:440px; top:126px; width:666px; height:84px">
+    <span class="name">JSON API</span>
+    <span class="note">scans &middot; findings.jsonl &middot; findings.sarif &middot; imports</span>
+  </div>
+  <div class="n serve" style="left:440px; top:226px; width:666px; height:46px">
+    <span class="name">SCAN QUEUE</span>
+    <span class="note" style="position:absolute; left:190px">one scan at a time</span>
+  </div>
+
+  <div class="legend" style="left:1240px; top:100px; width:420px">
+    <span class="name">HOW TO READ IT</span>
+    <span class="row"><i class="swatch torch"></i>runs in this process</span>
+    <span class="row"><i class="swatch rune"></i>over the network, and able to fail</span>
+    <span class="row" style="border-top:2px solid var(--edge); padding-top:7px">
+      Each phase degrades rather than stopping: a missing key costs that phase, not the scan.
+    </span>
+  </div>
+
+  <!-- the pipeline: docrot/scan.py -->
+  <div class="group" style="left:40px; top:320px; width:580px; height:770px">
+    <span class="tag">SCAN PIPELINE &middot; DOCROT/SCAN.PY</span>
+  </div>
+
+  <div class="n phase" style="left:60px; top:372px; width:500px; height:76px">
+    <span class="num">1</span>
+    <span class="name">ACQUIRE</span>
+    <span class="note">the docs, and the code they describe</span>
+  </div>
+  <div class="n phase" style="left:60px; top:492px; width:500px; height:76px">
+    <span class="num">2</span>
+    <span class="name">REGISTRY</span>
+    <span class="note">which releases exist, and when they shipped</span>
+  </div>
+  <div class="n phase" style="left:60px; top:612px; width:500px; height:76px">
+    <span class="num">3</span>
+    <span class="name">EXTRACT</span>
+    <span class="note">snippets, signatures and prose claims</span>
+  </div>
+  <div class="n phase" style="left:60px; top:732px; width:500px; height:76px">
+    <span class="num">4</span>
+    <span class="name">VERIFY</span>
+    <span class="note">every claim run, release by release</span>
+  </div>
+  <div class="n phase" style="left:60px; top:852px; width:500px; height:76px">
+    <span class="num">5</span>
+    <span class="name">GRAPH</span>
+    <span class="note">blast radius, and drift between releases</span>
+  </div>
+  <div class="n phase" style="left:60px; top:972px; width:500px; height:76px">
+    <span class="num">6</span>
+    <span class="name">REPORT</span>
+    <span class="note">findings, written down</span>
+  </div>
+
+  <!-- everything off this machine -->
+  <div class="n ext" style="left:700px; top:342px; width:700px; height:124px">
+    <span class="name">DOCS SITES</span>
+    <span class="via">httpx &middot; trafilatura &middot; mistune</span>
+    <span class="note">llms-full.txt → llms.txt → per-page .md → sitemap.xml → search API → HTML crawl</span>
+  </div>
+  <div class="n ext" style="left:700px; top:486px; width:700px; height:76px">
+    <span class="name">GIT REMOTES</span>
+    <span class="via">git &mdash; sparse, blobless clone</span>
+  </div>
+  <div class="n ext" style="left:700px; top:578px; width:700px; height:76px">
+    <span class="name">PYPI &middot; NPM</span>
+    <span class="via">httpx &mdash; releases and dates</span>
+  </div>
+  <div class="n ext" style="left:700px; top:670px; width:700px; height:100px">
+    <span class="name">OPENROUTER</span>
+    <span class="via">openai SDK</span>
+    <span class="note">claude-opus-5 → sonnet-5 &middot; prose claims only</span>
+  </div>
+  <div class="n ext" style="left:700px; top:786px; width:700px; height:88px">
+    <span class="name">DAYTONA SANDBOXES</span>
+    <span class="via">daytona SDK</span>
+    <span class="note">pip install, then introspect or run</span>
+  </div>
+  <div class="n ext" style="left:700px; top:890px; width:700px; height:88px">
+    <span class="name">NEO4J 5</span>
+    <span class="via">neo4j driver</span>
+    <span class="note">blast radius &middot; drift</span>
+  </div>
+  <div class="n ext none" style="left:700px; top:994px; width:700px; height:76px">
+    <span class="name">NOTHING OUTSIDE</span>
+    <span class="note">the report is written from what the other five brought back</span>
+  </div>
+
+  <!-- what is left on disk, and who reads it -->
+  <div class="n store" style="left:40px; top:1130px; width:580px; height:110px">
+    <span class="name">DATA/SCANS/</span>
+    <span class="note">scan &middot; status &middot; runs<br>read and written by the API and the CLI alike</span>
+  </div>
+  <div class="n out" style="left:700px; top:1130px; width:446px; height:110px">
+    <span class="name">FINDINGS.JSONL &middot; SARIF 2.1.0</span>
+    <span class="note">the full record, and the format code scanning reads</span>
+  </div>
+  <div class="n" style="left:1220px; top:1130px; width:446px; height:110px">
+    <span class="name">AI AGENTS &middot; CI</span>
+    <span class="note">annotated pull requests, and agents that fix what the scan found</span>
+  </div>
+</body></html>

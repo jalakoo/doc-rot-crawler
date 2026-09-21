@@ -1,0 +1,27 @@
+# Local Neo4j for docrot. Start with:  docker compose up -d
+# Browser UI: http://localhost:7474   (user: neo4j / pass: docrotlocal)
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: docrot-neo4j
+    # 127.0.0.1 only: published on every interface, this graph - and the
+    # password below - is reachable by anyone on the same network
+    ports:
+      - "127.0.0.1:7474:7474"   # HTTP browser
+      - "127.0.0.1:7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/docrotlocal
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_db_tx__log_rotation_retention__policy: 100M size
+    volumes:
+      - docrot-neo4j-data:/data
+      - docrot-neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  docrot-neo4j-data:
+  docrot-neo4j-logs:

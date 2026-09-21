@@ -1,0 +1,14 @@
+{
+  "name": "docrot-ui",
+  "private": true,
+  "description": "Lint and unit tests for the dashboard's browser code (docrot/ui). The Python package does not need this.",
+  "scripts": {
+    "lint": "eslint docrot/ui tests/js",
+    "test": "node --test \"tests/js/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.10.0",
+    "globals": "^17.12.0"
+  }
+}

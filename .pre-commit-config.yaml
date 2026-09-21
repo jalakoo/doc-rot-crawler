@@ -1,0 +1,32 @@
+# Runs on every commit: pre-commit install
+# Once, over everything already committed: pre-commit run --all-files
+repos:
+  # The installed binary (brew install gitleaks), not a downloaded toolchain:
+  # pre-commit would fetch Go through a python.org interpreter that has no CA
+  # bundle on macOS, which fails before the hook ever runs.
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (staged changes)
+        entry: gitleaks protect --staged --redact --verbose
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files     # images/dashboard.gif is 2.9MB; nothing else comes close
+        args: [--maxkb=4000]
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+        exclude: ^(data|spikes/out)/|\.(png|jsonl|sarif)$
+      - id: trailing-whitespace
+        exclude: ^(data|spikes/out)/|\.(png|jsonl|sarif)$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff                        # the same rules as `make lint`
+        files: ^(docrot|tests)/
