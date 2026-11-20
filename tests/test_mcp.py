@@ -630,3 +630,19 @@ def test_validation_problems_read_as_one_sentence_whichever_library_raised_them(
         assert problems(e).startswith("versions:")
     assert problems(ValueError(["a.", "b."])) == "a. b."
     assert problems(ValueError("plain")) == "plain"
+
+
+def test_detect_packages_carries_a_cli_row_and_a_note_about_github(agent):
+    agent.detected[REPO] = {**FOUND, "packages": [*FOUND["packages"], {
+        "name": "relate", "import_name": "relate", "ecosystem": "cli", "path": "",
+        "spec": "cli:relate", "latest": "1.2.0"}], "note": "No standalone relate CLI listed: rate limited."}
+    (repo,) = agent.ok("detect_packages", repos=[REPO])["repos"]
+    assert repo["packages"][-1]["spec"] == "cli:relate" and repo["packages"][-1]["ecosystem"] == "cli"
+    assert "rate limited" in repo["note"]
+
+
+def test_the_tools_explain_cli_packages(agent):
+    tools = agent.tools()
+    packages = tools["start_scan"].input_schema["properties"]["packages"]["description"]
+    assert "cli:relate" in packages and "GitHub" in packages and "3 of its command lines" in packages
+    assert "cli:name" in tools["detect_packages"].description

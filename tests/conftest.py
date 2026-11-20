@@ -25,3 +25,15 @@ def keychain():
     settings.use(backend)
     yield backend
     settings.use(None)
+
+
+@pytest.fixture(autouse=True)
+def github_forgotten():
+    """`binaries.lookup` remembers answers for ten minutes; a test must not
+    inherit another's, nor keep a token."""
+    from docrot.acquire import binaries
+    binaries.forget()
+    binaries.use_token("")
+    yield
+    binaries.forget()
+    binaries.use_token("")

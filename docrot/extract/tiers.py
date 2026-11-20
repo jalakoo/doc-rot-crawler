@@ -10,6 +10,7 @@ import re
 
 from ..models import Snippet, Tier
 from . import csharp, fences, javascript
+from .commands import Ownership
 from .completeness import classify
 
 PLACEHOLDER = re.compile(
@@ -24,14 +25,16 @@ CREDS = re.compile(r"\b([A-Z][A-Z0-9_]*_(?:API_)?(?:KEY|TOKEN|SECRET|PASSWORD))\
 def assign(snippets: list[Snippet], available_creds: set[str],
            import_name: str | list[str] = "",
            assume_credentialed: bool = False,
-           npm_packages: list[str] | None = None) -> None:
+           npm_packages: list[str] | None = None, own: Ownership | None = None) -> None:
     """`npm_packages` names the scan's npm packages. Without it JS/TS is
-    `unverifiable` and shell is judged by its pip lines alone, as before."""
+    `unverifiable` and shell is judged by its pip lines alone, as before. `own`
+    adds the commands a standalone CLI target (or a declared npm bin) owns."""
     names = [import_name] if isinstance(import_name, str) else list(import_name)
     npm = [n for n in (npm_packages or []) if n]
+    own = own or Ownership(npm)
     for s in snippets:
         s.reason = ""
-        s.tier = _tier(s, available_creds, names, assume_credentialed, npm)
+        s.tier = _tier(s, available_creds, names, assume_credentialed, npm, own)
 
 
 def skip(s: Snippet, reason: str) -> Tier:
@@ -41,14 +44,16 @@ def skip(s: Snippet, reason: str) -> Tier:
 
 
 def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
-          assume_credentialed: bool = False, npm_names: list[str] | None = None) -> Tier:
+          assume_credentialed: bool = False, npm_names: list[str] | None = None,
+          own: Ownership | None = None) -> Tier:
     import_names = [n for n in (import_names or []) if n]
     npm = [n for n in (npm_names or []) if n]
+    own = own or Ownership(npm)
     if fences.family(s.lang) == "not-code":
         return skip(s, "not-code")
 
-    if s.lang in ("bash", "sh", "shell", "console") or (npm and s.lang == "zsh"):
-        tier = _shell_tier(s.code, npm)
+    if s.lang in ("bash", "sh", "shell", "console") or (own.active and s.lang == "zsh"):
+        tier = _shell_tier(s.code, own)
         return skip(s, "no-package-use") if tier == "unverifiable" else tier
 
     if npm and javascript.is_js(s.lang):
@@ -109,20 +114,22 @@ def _touches(s: Snippet, import_name: str) -> bool:
     return bool(re.search(rf"\b(?:import|from)\s+{re.escape(import_name)}\b", s.code))
 
 
-def _shell_tier(code: str, npm: list[str]) -> Tier:
+def _shell_tier(code: str, own: Ownership) -> Tier:
     """Shell: install blocks run, CLI invocations are probed, the rest is skipped.
 
     Installing the scan's own packages tells us the documented install works.
     Installing anything else says nothing about these docs, and running a
     documented command is never safe, so the lane asks the CLI's own `--help`
-    instead (`structural`).
+    instead (`structural`) - but only for a command a target really owns
+    (`commands.Ownership`): `relate query` is the Rust binary's, not the npm
+    package's that merely shares the name.
     """
-    if npm:
+    if own.npm:
         installed = {pkg for pkg, _ in javascript.installs(code)}
-        if installed and installed <= set(npm) and javascript.pure_install(code):
+        if installed and installed <= set(own.npm) and javascript.pure_install(code):
             return "execute"
-        if javascript.invocations(code, npm):
-            return "structural"
+    if own.runs(code):
+        return "structural"
     return "execute" if _pure_install(code) else "unverifiable"
 
 

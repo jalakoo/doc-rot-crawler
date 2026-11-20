@@ -221,3 +221,12 @@ test("richText escapes everything except the builder's <b> and <code>", () => {
   assert.equal(L.richText("<code>pip install x</code>"), "<code>pip install x</code>");
   assert.equal(L.richText(null), "");
 });
+
+test("a cli package is labelled for what it is and needs a GitHub repo", () => {
+  assert.deepEqual(L.detectedLine({ name: "relate", ecosystem: "cli", import_name: "relate", path: "", latest: "1.2.0" }),
+    { name: "relate", meta: "CLI \u00b7 GitHub release binaries \u00b7 latest 1.2.0" });
+  assert.deepEqual(L.cliNeedsGithub(["pypi:x"], ["/srv/x"]), []);
+  assert.deepEqual(L.cliNeedsGithub(["cli:relate"], ["https://github.com/o/relate"]), []);
+  assert.equal(L.cliNeedsGithub(["cli:relate"], ["/srv/x", "https://gitlab.com/o/r"]).length, 1);
+  assert.equal(L.alignPackages(["r1"], ["CLI:relate"], ["cli:relate"]).length, 1);   // the prefix is not case sensitive
+});

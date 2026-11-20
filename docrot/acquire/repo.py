@@ -798,6 +798,27 @@ def dotnet_surface(code_root: Path) -> dict:
     return surface(texts)
 
 
+def npm_bins(root: Path) -> tuple[str, ...] | None:
+    """The command names the package at `root` declares in package.json's
+    `bin`: a string is the package's own (unscoped) name, an object's keys are
+    the names. `()` is an answer - the package ships no command - and `None`
+    means there is no readable package.json to ask. Ownership of a command
+    line (`extract.commands`) rests on the difference: `@relate/relate` has no
+    `bin`, and the `relate` its docs run is a different program."""
+    try:
+        meta = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    bin_ = meta.get("bin")
+    if isinstance(bin_, str):
+        return (str(meta.get("name") or "").rsplit("/", 1)[-1],) if meta.get("name") else ()
+    if isinstance(bin_, dict):
+        return tuple(str(k) for k in bin_)
+    return ()
+
+
 def symbols_at_head(path: Path, import_name: str, ecosystem: str = "pypi") -> set[str]:
     """Public symbols defined at HEAD, by AST walk.
 

@@ -46,6 +46,8 @@ GROUPS = [
      "note": "Daytona runs the snippets. Without a key, pages are reported unverified."},
     {"id": "llm", "title": "Extraction model",
      "note": "Optional. Without a key, tiering falls back to rules and prose claims are skipped."},
+    {"id": "github", "title": "GitHub",
+     "note": "Optional. Only raises GitHub's rate limit for looking up a command-line tool's releases."},
     {"id": "graph", "title": "Graph store",
      "note": "Neo4j. Optional - only `docrot blast` needs it."},
     {"id": "tuning", "title": "Run tuning", "note": "Leave blank to keep the default."},
@@ -63,6 +65,11 @@ FIELDS = [
     Field("EXTRACTION_MODELS", "Models", "llm",
           default="anthropic/claude-opus-5,anthropic/claude-sonnet-5",
           hint="Comma-separated vendor/model ids. The first is used; the rest are fallbacks."),
+
+    Field("GITHUB_TOKEN", "Token", "github", secret=True,
+          hint="Only raises the GitHub API rate limit (60 requests an hour without one) for release "
+               "lookups of standalone CLIs. A token with no scopes is enough. It is never sent into a "
+               "sandbox."),
 
     Field("NEO4J_URI", "URI", "graph", default="bolt://localhost:7687",
           hint="Use neo4j+s:// for Aura."),

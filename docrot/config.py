@@ -72,6 +72,9 @@ class Config:
     extraction_models: list[str] = field(
         default_factory=lambda: list(DEFAULT_EXTRACTION_MODELS))
 
+    # --- github: raises the rate limit of release lookups; never enters a sandbox ---
+    github_token: str = ""
+
     # --- tuning ---
     max_pages: int = 60
     concurrency: int = 8
@@ -106,7 +109,7 @@ class Config:
         """Values that must never appear in captured output or on disk."""
         vals = list(self.sandbox_env.values())
         for v in (self.daytona_api_key, self.extraction_api_key,
-                  self.neo4j_password):
+                  self.neo4j_password, self.github_token):
             if v and len(v) > 6:
                 vals.append(v)
         return vals
@@ -140,6 +143,7 @@ def load(env_file: str | Path | None = None) -> Config:
         neo4j_user=env.get("NEO4J_USERNAME", "neo4j"),
         neo4j_password=env.get("NEO4J_PASSWORD", "docrotlocal"),
         neo4j_database=env.get("NEO4J_DATABASE", "neo4j"),
+        github_token=(env.get("GITHUB_TOKEN") or env.get("GH_TOKEN") or "").strip(),
         extraction_api_key=env.get("EXTRACTION_API_KEY", ""),
         extraction_base_url=env.get(
             "EXTRACTION_BASE_URL", "https://openrouter.ai/api/v1"),

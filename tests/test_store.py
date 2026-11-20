@@ -257,7 +257,7 @@ def test_an_unknown_or_empty_prefix_is_rejected_with_every_problem_listed():
     problems = e.value.args[0]
     assert len(problems) == 4
     assert "Package 2 (cargo:serde) has an unknown ecosystem prefix 'cargo:'" in problems[0]
-    assert "use pypi:, npm: or nuget:" in problems[0]
+    assert "use pypi:, npm:, nuget: or cli:" in problems[0]
     assert "PyPI:foo" in problems[1]            # only the lowercase spellings count
     assert "Package 4" in problems[2] and "names no package" in problems[2]
     assert "gem:rails" in problems[3]

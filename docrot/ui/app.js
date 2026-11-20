@@ -957,6 +957,8 @@
     }
     var pkgInputs = rowsOf("pkg"), packages = L.alignPackages(
       repoInputs.map(function (i) { return i.value; }), typed, pkgInputs.map(function (i) { return i.value; }), picks);
+    var cliProblem = L.cliNeedsGithub(packages, checked.repos);
+    if (cliProblem.length) return showErrors(cliProblem, null);
     docInputs.concat(repoInputs).forEach(function (i) { i.value = i.value.trim(); i.removeAttribute("aria-invalid"); });
     checked.invalid.docs.forEach(function (i) { docInputs[i].setAttribute("aria-invalid", "true"); });
     checked.invalid.repos.forEach(function (i) { repoInputs[i].setAttribute("aria-invalid", "true"); });

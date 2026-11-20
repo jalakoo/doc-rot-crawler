@@ -337,3 +337,66 @@ def test_two_detects_of_one_new_repo_at_once_both_succeed(monorepo):
     for t in threads:
         t.join()
     assert len(out) == 4 and all("error" not in o and len(o["packages"]) == 2 for o in out)
+
+
+def test_detect_lists_a_cli_row_for_a_github_repo_whose_releases_carry_its_binary(
+        store, cfg, monorepo, monkeypatch):
+    import docrot.acquire.detect as det
+    from docrot.acquire.binaries import CliLookup, CliRelease
+    asked = []
+
+    def lookup(repo, name):
+        asked.append((repo, name))
+        return CliLookup(name, [CliRelease("1.1.0", "v1.1.0"), CliRelease("1.2.0", "v1.2.0")], installable=True)
+
+    monkeypatch.setattr(det, "clone", lambda repo, log, timeout: (monorepo, "abc123", "main"))
+    app = create_app(store, ScanWorker(store, lambda s, i: None),
+                     detect=lambda repo: det.detect(repo, cli_lookup=lookup))
+    with TestClient(app, base_url="http://127.0.0.1:8080") as c:
+        (found,) = c.post("/api/detect", json={"repos": ["https://github.com/o/mono"]}).json()["repos"]
+    row = _by_name(found)["mono"]
+    assert row == {"name": "mono", "import_name": "mono", "ecosystem": "cli", "path": "",
+                   "spec": "cli:mono", "latest": "1.2.0"}
+    assert asked == [("https://github.com/o/mono", "mono")]            # one lookup for the repo
+    assert sorted(p["spec"] for p in found["packages"][:2]) == ["npm:@mono/js", "pypi:mono-py"]
+    assert found["packages"][-1] is row                                 # the CLI row comes last
+
+
+def test_detect_leaves_the_cli_row_out_with_a_note_when_github_cannot_be_asked(monorepo, monkeypatch):
+    import docrot.acquire.detect as det
+    from docrot.acquire.binaries import RATE_LIMITED, CliLookup
+    monkeypatch.setattr(det, "clone", lambda repo, log, timeout: (monorepo, "abc123", "main"))
+    found = det.detect("https://github.com/o/mono",
+                       cli_lookup=lambda r, n: CliLookup(n, why=RATE_LIMITED, failed=True))
+    assert "error" not in found and not any(p["ecosystem"] == "cli" for p in found["packages"])
+    assert "No standalone mono CLI listed" in found["note"] and "GITHUB_TOKEN" in found["note"]
+
+
+def test_detect_does_not_ask_github_about_a_local_repo_or_when_an_npm_package_owns_the_bin(
+        monorepo, monkeypatch):
+    import docrot.acquire.detect as det
+    from docrot.acquire.binaries import CliLookup
+    asked = []
+
+    def lookup(repo, name):
+        asked.append(name)
+        return CliLookup(name, installable=True)
+
+    assert not any(p["ecosystem"] == "cli" for p in det.detect(str(monorepo), cli_lookup=lookup)["packages"])
+    (monorepo / "js" / "package.json").write_text('{"name": "@mono/js", "bin": {"mono": "cli.js"}}')
+    monkeypatch.setattr(det, "clone", lambda repo, log, timeout: (monorepo, "abc123", "main"))
+    found = det.detect("https://github.com/o/mono", cli_lookup=lookup)
+    assert not any(p["ecosystem"] == "cli" for p in found["packages"])
+    assert asked == []
+
+
+def test_detect_survives_a_lookup_that_raises(monorepo, monkeypatch):
+    import docrot.acquire.detect as det
+    monkeypatch.setattr(det, "clone", lambda repo, log, timeout: (monorepo, "abc123", "main"))
+
+    def boom(repo, name):
+        raise RuntimeError("surprise")
+
+    found = det.detect("https://github.com/o/mono", cli_lookup=boom)
+    assert sorted(p["ecosystem"] for p in found["packages"]) == ["npm", "pypi"]
+    assert "could not look for a standalone mono CLI" in found["note"]

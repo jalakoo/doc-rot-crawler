@@ -11,9 +11,12 @@ matched.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
-from .repo import CLONE_TIMEOUT, CloneError, _git, clone, find_packages, repo_name
+from . import binaries
+from .binaries import CliLookup
+from .repo import CLONE_TIMEOUT, CloneError, Package, _git, clone, find_packages, npm_bins, repo_name
 
 # manifest file name (or suffix) -> ecosystem docrot cannot verify yet
 OTHER_MANIFESTS = {"Cargo.toml": "rust", "go.mod": "go", "pom.xml": "java",
@@ -34,24 +37,69 @@ def _quiet(*_args) -> None:
     """Cloning logs through a callback; nothing may reach stdout (MCP's wire)."""
 
 
-def detect(repo: str, log=_quiet, timeout: int = CLONE_TIMEOUT) -> dict:
+def detect(repo: str, log=_quiet, timeout: int = CLONE_TIMEOUT,
+           cli_lookup: Callable[[str, str], CliLookup] | None = None) -> dict:
     """What `repo` holds. Never raises for a bad repo: the result is then
-    `{"repo", "error"}` and says what to do."""
+    `{"repo", "error"}` and says what to do.
+
+    A GitHub repo whose releases carry a Linux binary named like the repo also
+    lists that as a `cli` package (`cli:relate`). `cli_lookup` is injectable
+    like the clone is in tests; it is asked once per repo, and a GitHub that
+    cannot answer (rate limit, no network) only leaves the row out, with a
+    `note` saying why."""
     repo = (repo or "").strip()
     try:
         path, commit, branch = clone(repo, log, timeout)
         found = find_packages(path, repo_name(repo))
-        return {
-            "repo": repo, "commit": commit, "branch": branch,
-            "packages": [{"name": p.name, "import_name": p.import_name, "ecosystem": p.ecosystem,
-                          "path": _relative(p.root, path), "spec": f"{p.ecosystem}:{p.name}"}
-                         for p in found],
-            "other": other_ecosystems(path),
-        }
+        packages = [{"name": p.name, "import_name": p.import_name, "ecosystem": p.ecosystem,
+                     "path": _relative(p.root, path), "spec": f"{p.ecosystem}:{p.name}"}
+                    for p in found]
+        out = {"repo": repo, "commit": commit, "branch": branch, "packages": packages,
+               "other": other_ecosystems(path)}
+        if cli_lookup is None:
+            _use_configured_token()
+        row, note = cli_row(repo, found, cli_lookup)
+        if row:
+            packages.append(row)
+        if note:
+            out["note"] = note
+        return out
     except CloneError as e:
         return {"repo": repo, "error": str(e)}
     except Exception as e:      # a detect must never be a 500: the user can still name a package by hand
         return {"repo": repo, "error": f"{type(e).__name__}: {e}"[:300]}
+
+
+def _use_configured_token() -> None:
+    """The GitHub token from Settings or .env, for the rate limit's sake."""
+    from .. import config
+    try:
+        binaries.use_token(config.load().github_token)
+    except Exception:                 # no token is the normal case, never a reason to fail
+        pass
+
+
+def cli_row(repo: str, found: list[Package], lookup: Callable[[str, str], CliLookup] | None = None,
+            ) -> tuple[dict | None, str]:
+    """(the `cli` row for a repo, or None; a note when GitHub could not say)."""
+    lookup = lookup or binaries.lookup
+    if not binaries.github_slug(repo):
+        return None, ""
+    command = repo_name(repo)
+    for p in found:
+        declared = npm_bins(p.root) if p.ecosystem == "npm" else None
+        if p.ecosystem == "npm" and (command in declared if declared is not None
+                                     else p.name.rsplit("/", 1)[-1] == command):
+            return None, ""           # that npm package owns the command; there is no standalone one
+    try:
+        got = lookup(repo, command)
+    except Exception as e:            # detect is advisory: a surprise here must not lose the packages
+        return None, f"could not look for a standalone {command} CLI ({type(e).__name__})"
+    if not got.installable:
+        return None, (f"No standalone {command} CLI listed: {got.why}." if got.failed else "")
+    latest = got.releases[-1].label if got.releases else ""
+    return {"name": command, "import_name": command, "ecosystem": "cli", "path": "",
+            "spec": f"cli:{command}", "latest": latest}, ""
 
 
 def _relative(root: Path, base: Path) -> str:

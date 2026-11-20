@@ -36,6 +36,11 @@ def family(lang: str) -> str:
     return "not-code" if lang in NOT_CODE_LANGS else "other-code"
 
 
+# Fence languages that hold what a command printed rather than a program.
+OUTPUT_LANGS = frozenset({"", "text", "txt", "output", "plaintext", "plain", "log"})
+SHOWS_CAP = 1500          # chars of following output kept per snippet
+
+
 def parse(pages: list[Page]) -> list[Snippet]:
     md = mistune.create_markdown(renderer=None)
     out: list[Snippet] = []
@@ -47,22 +52,33 @@ def parse(pages: list[Page]) -> list[Snippet]:
             tokens = md(page.text)
         except Exception:
             tokens = []
+        anchor: Snippet | None = None       # the last program, while only output fences follow it
         for tok in _walk(tokens):
-            if tok.get("type") != "block_code":
+            kind = tok.get("type")
+            if kind == "blank_line":
+                continue
+            if kind != "block_code":
+                anchor = None
                 continue
             code = (tok.get("raw") or "").rstrip()
             if not code.strip():
                 continue
             info = (tok.get("attrs") or {}).get("info") or ""
             lang = info.strip().split()[0].lower() if info.strip() else _sniff(code)
+            is_output = (info.strip().split() or [""])[0].lower() in OUTPUT_LANGS
+            if anchor is not None and is_output:
+                anchor.shows = (anchor.shows + "\n" + code)[:SHOWS_CAP].strip()
             n += 1
-            out.append(Snippet(
+            snip = Snippet(
                 id=f"{slug}-{n:02d}",
                 page=page.url,
                 lang=lang,
                 code=code,
                 line=_line_of(page.text, code),
-            ))
+            )
+            out.append(snip)
+            if not is_output:
+                anchor = snip if lang not in NOT_CODE_LANGS else None
     return out
 
 

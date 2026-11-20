@@ -188,9 +188,9 @@ def test_shell_is_attributed_by_npm_or_cli_tokens():
     pkgs = [PYPI, NPM, wizard]
     install = _snip("bash", "")
     install.symbols = ["npm:@momentic/wizard@1.0.0"]
-    cli = _snip("bash", "")
+    cli = _snip("bash", "wizard init")      # a command is attributed by the line that runs it
     cli.symbols = ["cli:wizard", "cli:wizard init"]
-    bare = _snip("bash", "")
+    bare = _snip("bash", "momentic run")
     bare.symbols = ["cli:momentic", "cli:momentic run"]
     attribute([install, cli, bare], pkgs)
     assert [s.package for s in (install, cli, bare)] == ["@momentic/wizard", "@momentic/wizard", "momentic"]

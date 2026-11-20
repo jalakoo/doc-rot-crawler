@@ -62,6 +62,25 @@ from ..extract import javascript as js
 from ..extract.javascript import Invocation, Use
 from ..models import Result, Snippet, Status
 from . import runner
+from .clihelp import (  # noqa: F401  (moved there; the names stay importable from here)
+    DETAIL_CAP,
+    HELP_CAP,
+    MAX_DEPTH,
+    CliCheck,
+    Walk,
+    _excerpt,
+    chain_args,
+    command_names,
+    flag_present,
+    help_key,
+    judge_cli,
+    takes_positionals,
+    unknown_command_line,
+    usable,
+    value_like,
+    walk,
+    why_unusable,
+)
 from .runner import (
     CREDENTIAL_ERROR,
     INSTALL_ATTEMPTS,
@@ -78,10 +97,7 @@ MIN_NODE = 20
 
 IMPORT_MS = 20_000      # per module, so one hanging import cannot eat the lane
 HELP_MS = 20_000        # per `--help`
-MAX_DEPTH = 4           # subcommand words walked per invocation
-HELP_CAP = 60_000       # chars of help kept per command
 MAX_FINDINGS = 12
-DETAIL_CAP = 300
 
 # Transient npm failures, on top of runner.TRANSIENT_INSTALL.
 TRANSIENT_NPM = re.compile(
@@ -398,22 +414,6 @@ def strips_types(version: str) -> bool:
     return major >= 24 or (major == 23 and minor >= 6) or (major == 22 and minor >= 18)
 
 
-def help_key(bin_: str, args: list[str] | tuple[str, ...]) -> str:
-    return "\x1f".join([bin_, *args])
-
-
-def value_like(word: str) -> bool:
-    """A word that is a path, file, URL or value rather than a subcommand."""
-    return bool(re.search(r"[/.=:]", word)) or word.isdigit()
-
-
-@dataclass
-class CliCheck:
-    inv: Invocation
-    bin: str                    # the installed bin it resolved to; "" when none
-    reason: str = ""            # why it is not checkable / why there is no bin
-
-
 @dataclass
 class Plan:
     snippet: Snippet
@@ -461,16 +461,6 @@ def plan_snippet(s: Snippet, package: str, bins: dict[str, str]) -> Plan:
     return plan
 
 
-def chain_args(inv: Invocation) -> list[str]:
-    """The subcommand words worth asking the CLI about."""
-    out: list[str] = []
-    for w in inv.args[:MAX_DEPTH]:
-        if value_like(w):
-            break
-        out.append(w)
-    return out
-
-
 def build_payload(plans: list[Plan], package: str, cfg: Config) -> dict:
     """Everything the probe needs. Pure, so it is testable without a sandbox."""
     chains: dict[str, dict] = {}
@@ -493,245 +483,6 @@ def build_payload(plans: list[Plan], package: str, cfg: Config) -> dict:
             "flags": flags, "maxSrc": 600, "maxSrcBytes": 24_000_000,
             "importMs": IMPORT_MS, "helpMs": HELP_MS, "helpCap": HELP_CAP,
             "maxDecl": 400, "maxDeclBytes": 4_000_000, "deadlineMs": budget * 1000}
-
-
-# ------------------------------------------------------------------- judging
-# Everything below is pure: canned probe output in, verdict out.
-
-UNKNOWN_COMMAND = re.compile(
-    r"(unknown (?:sub)?command|unknown argument|unrecogni[sz]ed (?:sub)?command|invalid command|"
-    r"no such command|command[ :]+['\"`]?[\w:. -]*?['\"`]? ?(?:was )?not found|command not found|"
-    r"did you mean|not a (?:valid |known )?command|could not find command|"
-    r"is not a [\w-]+ command)", re.I)
-HELP_LIKE = re.compile(r"(\busage\b|\boptions?\b|\bcommands?\b|--help|(?:^|\s)-h[,\s])", re.I)
-LOGIN_WALL = re.compile(
-    r"(please (?:log ?in|sign ?in|authenticate)|not (?:logged|signed) in|log ?in required|"
-    r"authentication required|api[_ -]?key|unauthori[sz]ed|run [`'\"]?\S+ (?:login|auth))", re.I)
-QUOTED = re.compile(r"""['"`]([^'"`\s]+)['"`]""")
-COMMAND_HEADING = re.compile(r"^\s*(?:commands?|available commands|subcommands)\s*:?\s*$", re.I)
-ARGUMENT_HEADING = re.compile(r"^\s*(?:arguments?|args)\s*:?\s*$", re.I)
-USAGE_LINE = re.compile(r"^\s*(?:usage:?\s+|\$\s+)(\S.*)$", re.I)
-# what a usage line may say after the bin without the command taking positionals
-GENERIC_USAGE = re.compile(r"^[\[<]?(?:options?|flags?|command|commands|subcommand)[\]>]?(?:\.\.\.)?$", re.I)
-UNIVERSAL_FLAGS = frozenset({"--help", "--version"})
-
-
-def usable(h: dict | None) -> bool:
-    """Whether a captured `--help` is text the CLI meant as help."""
-    if not h or h.get("skipped") or h.get("timedOut") or h.get("error"):
-        return False
-    out = str(h.get("out") or "")
-    if not out.strip():
-        return False
-    code = h.get("code")
-    if code not in (0, None) and not HELP_LIKE.search(out):
-        return False
-    wall = code not in (0, None) and LOGIN_WALL.search(out) and not re.search(r"\busage:", out, re.I)
-    return not wall
-
-
-def why_unusable(h: dict | None) -> str:
-    if not h or h.get("skipped"):
-        return "the probe ran out of time before asking"
-    if h.get("timedOut"):
-        return "timed out"
-    if h.get("error"):
-        return f"could not be run ({h['error']})"
-    out = str(h.get("out") or "")
-    if not out.strip():
-        return "printed nothing"
-    if LOGIN_WALL.search(out):
-        return "wants a login or configuration"
-    return f"exited {h.get('code')} without help text"
-
-
-def _norm(text: str) -> str:
-    return "\n".join(line.rstrip() for line in str(text).strip().splitlines())
-
-
-def unknown_command_line(out: str, word: str) -> str:
-    """The line in which the CLI says it does not know `word` as a command,
-    or "" when it does not say so about this word.
-
-    A message that quotes some other token ('foo' while we asked about 'bar')
-    is not about our word and is not taken as evidence.
-    """
-    for line in str(out).splitlines():
-        if not UNKNOWN_COMMAND.search(line):
-            continue
-        quoted = QUOTED.findall(line)
-        if word.lower() in line.lower() or not quoted or all(q.lower() == word.lower() for q in quoted):
-            return line.strip()
-    return ""
-
-
-def flag_present(flag: str, text: str) -> bool:
-    """Whether `--flag` appears in help text; `--no-x` is satisfied by `--x`
-    or `--[no-]x`, and `--x` by a documented `--no-x`."""
-    def has(f: str) -> bool:
-        return bool(re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", text))
-    name = flag[2:]
-    if has(flag):
-        return True
-    if name.startswith("no-"):
-        base = name[3:]
-        return has(f"--{base}") or "--[no-]" + base in text
-    return has(f"--no-{name}") or "--[no-]" + name in text
-
-
-def command_names(text: str, bin_: str) -> set[str]:
-    """The command names a help text lists in its command table, aliases
-    included (`run|test`). Empty when it has no recognisable table."""
-    names: set[str] = set()
-    in_table, indent = False, -1
-    for line in str(text).splitlines():
-        if COMMAND_HEADING.match(line):
-            in_table, indent = True, -1
-            continue
-        if not in_table:
-            continue
-        if not line.strip():
-            continue
-        width = len(line) - len(line.lstrip())
-        if width == 0:
-            in_table = False             # the next section
-            continue
-        if indent < 0:
-            indent = width
-        if width != indent:
-            continue                     # a wrapped description
-        words = line.split()
-        while words and words[0] == bin_:
-            words = words[1:]            # yargs prints `tool build`
-        if words:
-            names.update(n for n in words[0].split("|") if n)
-    return names
-
-
-def takes_positionals(text: str) -> bool:
-    """Whether a help text says the command takes free-form arguments, in
-    which case an unlisted word may be a value, not a missing command."""
-    lines = str(text).splitlines()
-    if any(ARGUMENT_HEADING.match(ln) for ln in lines):
-        return True
-    for ln in lines:
-        m = USAGE_LINE.match(ln)
-        if m:
-            # `Usage: momentic run|test [options] [tests...]`: after the command
-            # path, any bracketed word that is not options/command is a positional
-            return any(re.fullmatch(r"[\[<].*[\]>]|.*\.\.\.", w) and not GENERIC_USAGE.match(w)
-                       for w in m.group(1).split()[1:])
-    return False
-
-
-@dataclass
-class Walk:
-    resolved: list[str] = field(default_factory=list)
-    root_ok: bool = True              # whether the root `--help` was usable at all
-    help: dict | None = None          # help of the deepest command that resolved
-    reliable: bool = True             # whether `help` can be trusted for flag checks
-    missing_word: str = ""
-    missing_line: str = ""
-    inferred: bool = False            # from the command table, not an error the CLI printed
-    note: str = ""
-
-
-def walk(bin_: str, words: list[str], helps: dict) -> Walk:
-    """Left to right, ask the CLI about each word and let it answer."""
-    root = helps.get(help_key(bin_, []))
-    w = Walk(help=root)
-    if not usable(root):
-        w.reliable = w.root_ok = False
-        w.note = f"`{bin_} --help` {why_unusable(root)}"
-        return w
-    parent = root
-    for i, word in enumerate(words):
-        h = helps.get(help_key(bin_, words[:i + 1]))
-        if h is None or h.get("skipped") or h.get("timedOut") or h.get("error") \
-                or not str(h.get("out") or "").strip():
-            w.reliable = False
-            w.note = f"`{bin_} {' '.join(words[:i + 1])} --help` {why_unusable(h)}"
-            return w
-        said = unknown_command_line(str(h.get("out")), word)
-        if said:
-            w.missing_word, w.missing_line = word, said
-            return w
-        if not usable(h):
-            w.reliable = False
-            w.note = f"`{bin_} {' '.join(words[:i + 1])} --help` {why_unusable(h)}"
-            return w
-        if _norm(str(h.get("out"))) == _norm(str(parent.get("out") if parent else "")):
-            # The CLI swallowed the word (commander prints the parent's help for
-            # `tool nonsense --help`). That is a positional - unless the parent's
-            # own command table is complete and takes no free-form arguments, in
-            # which case the CLI has told us, in its own words, what it knows.
-            ptext = str(parent.get("out") if parent else "")
-            listed = command_names(ptext, bin_)
-            if len(listed) >= 2 and word.lower() != "help" and word not in listed \
-                    and not takes_positionals(ptext):
-                path = " ".join([bin_, *w.resolved])
-                w.missing_word, w.inferred = word, True
-                w.missing_line = (f"'{word}' is not among the commands `{path} --help` lists "
-                                  f"({', '.join(sorted(listed))[:200]})")
-            return w                  # swallowed as a positional argument
-        w.resolved.append(word)
-        w.help = parent = h
-    return w
-
-
-def _excerpt(text: str, limit: int = DETAIL_CAP) -> str:
-    lines = [ln.rstrip() for ln in str(text).strip().splitlines() if ln.strip()]
-    return "\n".join(lines)[:limit]
-
-
-def judge_cli(c: CliCheck, helps: dict, package: str, bins: dict[str, str],
-              in_source: frozenset[str] | set[str] = frozenset()) -> tuple[int, list[dict], list[str]]:
-    """(checks that held, findings, notes) for one invocation. `in_source` are
-    the flags the package's own code names: one of those missing from `--help`
-    is hidden or undocumented, not wrong."""
-    inv = c.inv
-    if not c.bin:
-        if c.reason.startswith("installs no bin"):
-            have = ", ".join(sorted(bins)) or "none"
-            return 0, [{"check": "bin", "subject": inv.bin, "line": inv.line,
-                        "message": f"{package} installs no bin named '{inv.bin}' (bins: {have})",
-                        "detail": inv.text[:DETAIL_CAP]}], []
-        return 0, [], [f"line {inv.line}: {c.reason}"]
-
-    w = walk(c.bin, chain_args(inv), helps)
-    if not w.root_ok:
-        return 0, [], [f"line {inv.line}: {w.note}; commands and flags not judged"]
-    held = 1       # the bin exists and answers --help
-    if w.missing_word:
-        subject = " ".join([c.bin, *w.resolved, w.missing_word])
-        return held, [{"check": "command", "subject": subject, "line": inv.line,
-                       "message": (w.missing_line if w.inferred else
-                                   f"the CLI does not know the command '{w.missing_word}': {w.missing_line}"),
-                       "detail": _excerpt(w.help.get("out", "")) if w.help else ""}], []
-    held += len(w.resolved)
-    notes: list[str] = []
-    if w.note:
-        notes.append(f"line {inv.line}: {w.note}; flags not judged")
-    findings: list[dict] = []
-    root = helps.get(help_key(c.bin, []))
-    texts = [str(h.get("out") or "") for h in (w.help, root) if h and usable(h)]
-    cmd = " ".join([c.bin, *w.resolved])
-    for flag in inv.flags:
-        if flag in UNIVERSAL_FLAGS:
-            continue
-        if not w.reliable:
-            continue
-        if any(flag_present(flag, t) for t in texts):
-            held += 1
-        elif flag in in_source:
-            notes.append(f"line {inv.line}: {flag} is not in `{cmd} --help` but the package's own "
-                         "code accepts it (a hidden flag); not judged")
-        else:
-            findings.append({
-                "check": "flag", "subject": f"{cmd} {flag}", "line": inv.line,
-                "message": f"{flag} does not appear in `{cmd} --help`",
-                "detail": _excerpt(w.help.get("out", "") if w.help else "")})
-    return held, findings, notes
 
 
 def judge_uses(plan: Plan, doc: dict) -> tuple[int, list[dict], list[str]]:

@@ -16,6 +16,7 @@ import re
 
 from ..models import Snippet
 from . import csharp, javascript
+from .commands import Ownership
 
 BUILTINS = set(dir(builtins))
 PIP_PKG = re.compile(r"^[A-Za-z][\w.\-]*(\[[\w,\-]+\])?(==[\w.\-]+)?$")
@@ -23,21 +24,24 @@ ENV_ASSIGN = re.compile(r"\b([A-Z][A-Z0-9_]{3,})\s*=")
 
 
 def annotate(snippets: list[Snippet], import_name: str | list[str] = "",
-             npm_packages: list[str] | None = None) -> None:
+             npm_packages: list[str] | None = None, own: Ownership | None = None) -> None:
     """Fill each snippet's `symbols`.
 
     `npm_packages` names the scan's npm packages. Without it nothing here
     changes: JS stays symbol-less and a shell block yields only its `pip:` and
-    `env:` tokens, which is what every Python-only scan relied on.
+    `env:` tokens, which is what every Python-only scan relied on. `own` also
+    says which commands are a target's (`commands.Ownership`): a standalone
+    CLI's, an npm package's declared bins.
     """
     names = [import_name] if isinstance(import_name, str) else list(import_name)
     names = [n for n in names if n]
     npm = [n for n in (npm_packages or []) if n]
+    own = own or Ownership(npm)
     for s in snippets:
         if s.lang in ("python", "py", "python3"):
             s.symbols = _python(s.code, names)
-        elif s.lang in ("bash", "sh", "shell", "console") or (npm and s.lang == "zsh"):
-            s.symbols = sorted({*_shell(s.code), *(_npm_shell(s.code, npm) if npm else ())})
+        elif s.lang in ("bash", "sh", "shell", "console") or (own.active and s.lang == "zsh"):
+            s.symbols = sorted({*_shell(s.code), *(_npm_shell(s.code, own) if own.active else ())})
         elif npm and javascript.is_js(s.lang):
             s.symbols = _javascript(s.code, npm)
         elif csharp.is_csharp(s.lang):
@@ -195,14 +199,16 @@ def _javascript(code: str, npm: list[str]) -> list[str]:
 SUBCOMMAND = re.compile(r"^[a-z][a-z0-9:-]*$")
 
 
-def _npm_shell(code: str, npm: list[str]) -> set[str]:
+def _npm_shell(code: str, own: Ownership) -> set[str]:
     """`npm:<pkg>[@version]` for every install line and `cli:<bin> [<sub>]` for
-    each run of a target package's CLI.
+    each run of a target's command (an npm package's bin or a standalone CLI).
 
     Every installed package is listed, not just the targets: attribution and
     the tier rule both need to see that a block installs something else."""
-    out = {f"npm:{pkg}@{ver}" if ver else f"npm:{pkg}" for pkg, ver in javascript.installs(code)}
-    for inv in javascript.invocations(code, npm):
+    out = ({f"npm:{pkg}@{ver}" if ver else f"npm:{pkg}" for pkg, ver in javascript.installs(code)}
+           if own.npm else set())
+    for run in own.runs(code):
+        inv = run.inv
         out.add(f"cli:{inv.bin}")
         if inv.args and SUBCOMMAND.match(inv.args[0]):
             out.add(f"cli:{inv.bin} {inv.args[0]}")

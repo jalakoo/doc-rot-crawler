@@ -176,20 +176,25 @@ def clean_sources(docs: list[str], repos: list[str]) -> tuple[list[str], list[st
     return docs, repos
 
 
-ECOSYSTEMS = ("pypi", "npm", "nuget")
+ECOSYSTEMS = ("pypi", "npm", "nuget")        # registries: what `ecosystem: auto` asks
+# `cli:relate` names a standalone command-line tool, which no registry lists:
+# its versions are its GitHub repo's releases. So it is a prefix, never a
+# registry to look a bare name up on.
+PREFIXES = (*ECOSYSTEMS, "cli")
+CLI_NAME = re.compile(r"^[A-Za-z0-9][\w.+-]*$")
 
 
 def split_package(entry: str) -> tuple[str, str]:
     """`(ecosystem, name)` of a packages entry; the ecosystem is "" when the
-    entry carries no `pypi:`/`npm:`/`nuget:` prefix.
+    entry carries no `pypi:`/`npm:`/`nuget:`/`cli:` prefix.
 
-    Only those three lowercase prefixes count. Names never hold a colon of
+    Only those lowercase prefixes count. Names never hold a colon of
     their own - `@relate/relate` has `@` and `/`, `Relate.Net` has dots - so a
     colon always means a prefix, and an unknown one is `clean_packages`' to
     reject rather than ours to guess at."""
     entry = (entry or "").strip()
     head, colon, rest = entry.partition(":")
-    if colon and head in ECOSYSTEMS:
+    if colon and head in PREFIXES:
         return head, rest.strip()
     return "", entry
 
@@ -199,8 +204,10 @@ def clean_packages(packages: list[str] | None) -> list[str]:
     in the middle keeps its slot. Only trailing blanks are dropped.
 
     An entry may start with `pypi:`, `npm:` or `nuget:` to say which registry
-    it is on (`npm:@relate/relate`); the form is normalised to `eco:name`.
-    Raises ValueError listing every entry with an unknown prefix or no name."""
+    it is on (`npm:@relate/relate`), or `cli:` for a standalone command-line
+    tool whose binaries a GitHub repo releases (`cli:relate`); the form is
+    normalised to `eco:name`. Raises ValueError listing every entry with an
+    unknown prefix or no name."""
     out = [(p or "").strip() for p in packages or []]
     problems: list[str] = []
     for i, entry in enumerate(out):
@@ -211,15 +218,29 @@ def clean_packages(packages: list[str] | None) -> list[str]:
             out[i] = f"{eco}:{name}"
             if not name:
                 problems.append(f"Package {i + 1} ({entry}) names no package after {eco}:.")
+            elif eco == "cli" and not CLI_NAME.match(name):
+                problems.append(f"Package {i + 1} ({entry}) is not a command name - cli: takes the "
+                                "name of the executable, like cli:relate.")
         elif ":" in entry:
             problems.append(f"Package {i + 1} ({entry}) has an unknown ecosystem prefix "
-                            f"'{entry.partition(':')[0]}:' - use pypi:, npm: or nuget: "
+                            f"'{entry.partition(':')[0]}:' - use pypi:, npm:, nuget: or cli: "
                             "(lowercase), or no prefix.")
     if problems:
         raise ValueError(problems)
     while out and not out[-1]:
         out.pop()
     return out
+
+
+def _need_github(repos: list[str] | None, pkgs: list[str]) -> None:
+    """A `cli:` entry is installed from a GitHub repo's release binaries, so the
+    scan must have one; saying so here beats a scan that fails minutes later."""
+    from .acquire.binaries import github_slug
+    clis = [p for p in pkgs if split_package(p)[0] == "cli"]
+    if clis and not any(github_slug(r or "") for r in repos or []):
+        raise ValueError([f"{clis[0]} needs the GitHub repository that publishes its release "
+                          "binaries - add it as a repository (https://github.com/org/name). "
+                          "docrot installs a command-line tool from its releases."])
 
 
 def align_packages(repos: list[str], packages: list[str] | None) -> list[str]:
@@ -232,6 +253,7 @@ def align_packages(repos: list[str], packages: list[str] | None) -> list[str]:
     the last repo are repo-less packages and stay at the end.
     """
     pkgs = clean_packages(packages)          # validated at the positions the user gave
+    _need_github(repos, pkgs)
     slot: dict[str, int] = {}
     out: list[str] = []
     for i, raw in enumerate(repos or []):

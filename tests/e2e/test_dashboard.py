@@ -35,6 +35,11 @@ FOUND = {"repo": RELATE, "commit": "abc123def456", "branch": "main", "other": ["
              {"name": "Relate.Net", "import_name": "Relate.Net", "ecosystem": "nuget",
               "path": "clients/dotnet/src/Relate.Net", "spec": "nuget:Relate.Net"}]}
 
+# a repo whose GitHub releases carry the `relate` binary lists it beside its packages
+FOUND_CLI = {**FOUND, "packages": [*FOUND["packages"],
+             {"name": "relate", "import_name": "relate", "ecosystem": "cli", "path": "",
+              "spec": "cli:relate", "latest": "1.2.0"}]}
+
 COVERAGE = {"tiers": {"execute": 4, "structural": 10, "unverifiable": 172},
             "unverifiable": {"no-package": 120, "not-code": 35, "no-checker": 17},
             "no_checker": {"rust": 9, "go": 8},
@@ -365,6 +370,40 @@ def test_a_typed_package_and_the_ticked_ones_are_sent_together(page: Page, dashb
     dialog.get_by_role("button", name="Start scan").click()
     expect(dialog).to_be_hidden()
     assert [r.packages for r in dashboard.store.all()] == [["by-hand", "npm:@relate/relate"]]
+
+
+def test_a_detected_cli_is_listed_with_its_label_and_can_be_unticked(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND_CLI
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    group = page.get_by_role("group", name="Packages found in relatedb/relate")
+    expect(group.get_by_role("checkbox")).to_have_count(4)
+    expect(group).to_contain_text("CLI · GitHub release binaries · latest 1.2.0")
+    group.locator('input[value="cli:relate"]').uncheck()
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [
+        ["npm:@relate/relate", "pypi:relate-db", "nuget:Relate.Net"]]
+
+
+def test_unticking_the_packages_and_keeping_the_cli_sends_only_cli(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND_CLI
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    for spec in ("npm:@relate/relate", "pypi:relate-db", "nuget:Relate.Net"):
+        page.locator(f'.found input[value="{spec}"]').uncheck()
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [["cli:relate"]]
+
+
+def test_a_cli_package_needs_a_github_repo_and_says_so_before_sending(page: Page, dashboard):
+    dialog = open_form_with_repo(page, dashboard, repo="/srv/code/relate")
+    page.get_by_role("textbox", name="Package for repository 1", exact=True).fill("cli:relate")
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(page.locator("#formErr")).to_contain_text("cli:relate needs the GitHub repository")
+    assert dashboard.store.all() == []
+    expect(page.locator("#fEco option")).to_have_text(["Auto-detect", "PyPI", "npm", "NuGet"])
 
 
 def test_unticking_everything_asks_for_a_package(page: Page, dashboard):

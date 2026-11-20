@@ -40,6 +40,11 @@ class Snippet(BaseModel):
     package: str = ""                     # distribution this snippet exercises
     # why `tier` is unverifiable (a key of REASONS); empty for every other tier
     reason: str = ""
+    # output fences (`text`, `output`...) directly after this one on the page:
+    # what the docs say it prints. A page that shows a command failing on
+    # purpose ("a mistyped flag exits 2: Error: unknown flag: --readonly") is
+    # not rot when the command does fail that way.
+    shows: str = ""
 
 
 class Claim(BaseModel):

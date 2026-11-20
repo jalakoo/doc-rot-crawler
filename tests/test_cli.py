@@ -143,8 +143,11 @@ def _relate(tmp_path):
 @pytest.fixture
 def cloned(monkeypatch, tmp_path):
     import docrot.acquire.repo as repo
+    from docrot.acquire import binaries
     paths = {}
     monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (paths[r], "abc123", "main"))
+    # no test asks GitHub: a repo whose releases carry no binary
+    monkeypatch.setattr(binaries, "lookup", lambda r, n: binaries.CliLookup(n, why="offline"))
     return paths
 
 
@@ -176,3 +179,30 @@ def test_packages_reports_a_repo_it_cannot_fetch(monkeypatch, capsys):
     monkeypatch.setattr(repo, "clone", refuse)
     assert cli.main(["packages", "https://github.com/o/nope"]) == 3
     assert "couldn't fetch https://github.com/o/nope" in capsys.readouterr().out
+
+
+def test_packages_lists_the_standalone_cli_the_releases_carry(cloned, tmp_path, capsys, monkeypatch):
+    from docrot.acquire import binaries
+    cloned["https://github.com/relatedb/relate"] = _relate(tmp_path)
+    monkeypatch.setattr(binaries, "lookup", lambda r, n: binaries.CliLookup(
+        n, [binaries.CliRelease("1.2.0", "v1.2.0")], installable=True))
+    assert cli.main(["packages", "https://github.com/relatedb/relate"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "cli:relate" in out and "GitHub release binaries (latest 1.2.0)" in out
+
+
+def test_packages_says_why_when_github_could_not_be_asked(cloned, tmp_path, capsys, monkeypatch):
+    from docrot.acquire import binaries
+    cloned["https://github.com/relatedb/relate"] = _relate(tmp_path)
+    monkeypatch.setattr(binaries, "lookup", lambda r, n: binaries.CliLookup(
+        n, why=binaries.RATE_LIMITED, failed=True))
+    assert cli.main(["packages", "https://github.com/relatedb/relate"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "No standalone relate CLI listed" in out and "GITHUB_TOKEN" in out and "cli:relate" not in out
+
+
+def test_scan_help_explains_cli_packages(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["scan", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "cli:relate" in text and "GitHub release binaries" in text

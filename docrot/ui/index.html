@@ -286,7 +286,9 @@
         <p class="hint">Package is optional. Name it when a repo has no package metadata or ships several packages,
           or to check a published package with no repo. Left empty, a repo contributes up to 6 packages
           its docs mention; naming any package of a repo restricts it to those. Prefix it to pick the registry
-          (<b>pypi:name</b>, <b>npm:name</b>, <b>nuget:name</b>); a bare name with no repo uses the <b>Ecosystem</b> in Scan options.</p>
+          (<b>pypi:name</b>, <b>npm:name</b>, <b>nuget:name</b>); a bare name with no repo uses the <b>Ecosystem</b> in Scan options.
+          A standalone command-line tool is <b>cli:name</b> and needs a GitHub repo that publishes its release binaries;
+          <b>Detect packages</b> lists it when it finds them.</p>
       </fieldset>
 
       <details class="opts">

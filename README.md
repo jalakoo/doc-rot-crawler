@@ -40,7 +40,8 @@ costs the next scan a fresh clone and crawl.
 
 Add scans from the dashboard's **New scan** dialog, or from the CLI. A scan can
 pair several docs sites with several repos, and a repo can hold several
-packages, in any mix of PyPI, npm and NuGet; each package is verified in its own
+packages, in any mix of PyPI, npm and NuGet, plus a standalone command-line tool
+published as GitHub release binaries; each package is verified in its own
 lane against its own releases (see [Repos with several packages](#repos-with-several-packages)).
 
 ```bash
@@ -81,6 +82,7 @@ docrot packages https://github.com/relatedb/relate
 #   npm:@relate/relate   @relate/relate   clients/javascript
 #   pypi:relate-db       relate            surfaces/relate-python/python
 #   nuget:Relate.Net     Relate.Net        clients/dotnet/src/Relate.Net
+#   cli:relate           relate            GitHub release binaries (latest 1.2.0)
 ```
 
 Then scan it. Every package becomes its own target, verified in its own lane
@@ -112,6 +114,9 @@ docrot scan --name Relate --docs-url https://relatedb.ai/docs/ \
   to include them`). A repo-only scan has no docs site, so the repo's own docs
   are scored. A package that is the primary pick (see below) goes first
   whatever its score.
+- **A standalone CLI**, when the repo's own binary is what the docs run (see
+  [Standalone CLIs](#standalone-clis)). It is proposed beside the packages above,
+  does not count against the cap, and is logged like them.
 - **Nothing mentioned, or only one package.** The single best package, picked as
   it always was, so a Streamlit, Pydantic or Perseus scan is unchanged.
 - **A name the repo does not have** is verified from its registry. Written
@@ -130,8 +135,8 @@ does contain Cargo.toml, go.mod - docrot has no lane for those yet`).
 
 **Ecosystem per package.** Each package gets its ecosystem from its manifest. For
 a name no repo describes, give the registry as a prefix on the entry: `pypi:relate-db`,
-`npm:@relate/relate`, `nuget:Relate.Net` (only these three lowercase prefixes;
-anything else is rejected). Without a prefix, `--ecosystem` decides:
+`npm:@relate/relate`, `nuget:Relate.Net` (only these lowercase prefixes, and `cli:`
+for a standalone tool; anything else is rejected). Without a prefix, `--ecosystem` decides:
 
 - `auto` (the CLI default) asks PyPI, npm and NuGet and uses the one that has the
   name. If several do, the scan stops and shows the prefixes to choose between;
@@ -219,6 +224,87 @@ Known limits: the package is installed from the npm registry, so one that is
 unpublished, private or only buildable from source is not verified. A CLI that
 needs a login before it prints help is `unverified`, and a snippet that depends
 on files or state the page never shows is not run.
+
+### Standalone CLIs
+
+Some tools are neither a PyPI, npm nor NuGet package but a binary: Relate's `relate`
+(`relate query`, `relate clone`, `relate extension ...`, `relate serve`) is a Rust
+program, and most of Relate's shell snippets run it. No registry lists its
+versions, so they come from the repo's GitHub releases, and the binary from the
+release's own assets. Name one with `cli:`, or let docrot propose it:
+
+```bash
+docrot scan --name "Neo4j Relate" --docs-url https://relatedb.ai/docs/ \
+            --repo https://github.com/relatedb/relate --versions 2
+docrot scan --docs-url https://relatedb.ai/docs/ --repo https://github.com/relatedb/relate \
+            --package cli:relate        # only the CLI, nothing else from that repo
+```
+
+**What is checked.** For each version tested, one sandbox downloads that release's
+Linux binary and runs **only `--help` and `--version`** (documented commands are
+never executed). Every documented subcommand is looked up in its parent's
+`--help`, and every `--long-flag` in the help of the command it is used with; a
+flag the help does not list is asked about directly (`<cmd> --flag --help`) and,
+when the tool answers only with help, searched for in the binary itself, since
+frameworks hide options they still accept. After installing, `--version` must name
+the release asked for, or that version is `blocked` with the reason - an install
+that quietly fetched the latest would make every version agree with itself. Only
+snippets that run the command are checked; a block that never runs it is
+reported as `use no scanned package`. Three things are deliberately not called
+wrong: a command the page goes on to show failing (the output fence after
+`relate --readonly ...` reads `Error: unknown flag: --readonly`: that is the
+documented error), a command run under its own environment
+(`RELATE_AGENT_MODE=1 relate agent-feedback ...` - the CLI offers other commands
+in that mode, and docrot never runs a variable the docs supply), and a command
+the CLI's own error names as one it has (`unknown command: agent-feedback ... the
+agent surface is 'relate agent-feedback'`).
+
+**Versions.** The releases of a GitHub repo are its version list: tags that are a
+bare version, or one behind the tool's own name or a generic word (`v1.2.0`,
+`cli-v1.2.0`, `release-1.2.0`) - Relate's repo also releases SDKs and extensions
+(`relate-extensions-git-to-graph-0.14.0`), whose version lines are not the
+tool's and are ignored. Versions are picked across major and minor lines, like
+npm's, because releases can be days apart and neighbours agree on everything.
+The binary is the release asset for Linux and the sandbox's CPU that no other
+product explains (not the `.jar`, the npm tarball or the FFI library that share
+the release); raw binaries, `.tar.gz`, `.tar.xz` and `.zip` are all understood.
+
+**Automatic selection.** With nothing named for a repo, a CLI named like the repo
+is added when both hold: the docs show the command at least **3 times in shell
+fences** (`relate query ...`; prose and `npx relate` do not count - Relate's docs
+have 412 such lines), and the repo's GitHub releases carry an installable Linux
+binary for it (one API request per repo, kept for ten minutes). It is not counted
+against the cap of 6 packages. It is never proposed when a selected npm package
+already ships that bin (its package.json `bin`), when GitHub cannot be asked
+(a rate limit or no network is logged and the CLI skipped; the scan goes on), or
+when the repo is not on GitHub. Naming a package for the repo, including `cli:name`,
+turns the automatic choice off for that repo.
+
+**Who owns a command.** A command line is evidence about a package only if that
+package puts the command on the PATH. An npm package owns a bare command when its
+package.json declares that `bin` (a registry-only npm package is guessed at by
+its unscoped name, as before); `npx pkg ...` always belongs to `pkg`; a CLI
+target owns its command name. Relate's `@relate/relate` declares no `bin`, so
+its 330 `relate ...` snippets used to be counted as structural and checked
+against nothing. With the CLI target they are checked against the binary;
+without one they are `unverifiable` (`use no scanned package`), not structural.
+A Python or JavaScript snippet that lands on a CLI target is `no package in
+that language`.
+
+**Limits.** Linux binaries only (the sandbox is Linux); GitHub-hosted releases
+only; the downloaded binary is not checksum- or signature-verified, and runs
+only inside the ephemeral sandbox, never on your machine; only long flags
+(`--flag`) are checked, so a typo in a short flag goes unnoticed; a wrong
+subcommand is called wrong only when the tool says so in its own words or its
+help lists its commands (a hand-written parser that takes any word as a
+positional is judged only for a word one typo from a real command), so some
+mistakes are left unverified rather than failed; a CLI that needs a login
+before printing help is `unverified`. There is no option for a custom install
+command: an install command found in docs text is never run.
+
+A GitHub token raises the API's 60-requests-an-hour limit for release lookups:
+set `GITHUB_TOKEN` in `.env`, or on the Settings page. It needs no scopes, is
+never sent into a sandbox and is redacted from output.
 
 ## How it fits together
 
@@ -415,6 +501,7 @@ dashboard: a scan an agent starts shows up in `docrot scans` and on the dashboar
 | `get_findings` | a run's findings in the [JSON Lines record shape](#records), filtered by `kinds` or `page_contains`, paged with `limit` and `offset`, with a total |
 | `scan_diff` | what got worse or better since the previous run, as `docrot diff` reports it |
 | `rename_impact` | which pages break if a symbol is renamed. Answered from the scan's own index, so it needs no Neo4j; the result says whether the report or the graph answered |
+| `detect_packages` | the packages a repo holds, as `eco:name` specs to pass to `start_scan` (a standalone CLI shows as `cli:name` when its GitHub releases carry the binary). Run it before `start_scan` on a repo you do not know |
 | `start_scan` | queue a scan of docs against repos and packages, and return at once. Runs for minutes and spends sandbox time and model credit. Reuses the scan with the same sources, as the CLI does |
 | `rerun_scan` | queue another run of an existing scan |
 
@@ -464,7 +551,7 @@ On stdio, stdout carries only protocol frames. Everything else the server says g
 ## Settings
 
 The dashboard's **Settings** page (`#/settings`) edits the same options as `.env` - API keys,
-models, the graph store, run tuning and the `SANDBOX_ENV_*` credentials forwarded into sandboxes.
+models, the graph store, an optional GitHub token (a higher rate limit for CLI release lookups), run tuning and the `SANDBOX_ENV_*` credentials forwarded into sandboxes.
 What you save there is kept in the operating system's keychain (macOS Keychain, Windows Credential
 Locker, or the Secret Service on Linux) as one item, service `docrot`, account `settings`. It is
 never written to a file.

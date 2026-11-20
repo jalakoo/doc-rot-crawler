@@ -102,7 +102,7 @@
      the scan verify exactly the named packages of that repo, which is why a
      typed name and a pick are both kept. A pick equal to a typed name, with or
      without its prefix, counts once. */
-  var PREFIX = /^(pypi|npm|nuget):/i;
+  var PREFIX = /^(pypi|npm|nuget|cli):/i;
   /* the same package, typed with or without its ecosystem prefix; two prefixed
      names are the same only if the ecosystems agree too */
   function samePackage(a, b) {
@@ -133,6 +133,15 @@
     return out;
   }
 
+  /* A `cli:` package is installed from a GitHub repo's release binaries, so the
+     scan needs such a repo; the server says the same, but not until Start. */
+  var GITHUB = /github\.com[/:][\w.-]+\/[\w.-]+/i;
+  function cliNeedsGithub(packages, repos) {
+    var cli = packages.filter(function (p) { return /^cli:/i.test(p); });
+    if (!cli.length || repos.some(function (r) { return GITHUB.test(r); })) return [];
+    return [cli[0] + " needs the GitHub repository that publishes its release binaries - add it as a repository (https://github.com/org/name)."];
+  }
+
   /* What a repo's detection left ticked, for alignPackages: null when every
      box is ticked (send nothing, the scan chooses), else the ticked specs. */
   function detectedPicks(specs, ticked) {
@@ -140,13 +149,14 @@
     return on.length === specs.length ? null : on;
   }
 
-  var ECO_LABEL = { pypi: "PyPI", npm: "npm", nuget: "NuGet" };
+  var ECO_LABEL = { pypi: "PyPI", npm: "npm", nuget: "NuGet", cli: "CLI \u00b7 GitHub release binaries" };
   var OTHER_LABEL = { rust: "Rust", go: "Go", java: "Java", swift: "Swift", ruby: "Ruby", php: "PHP" };
 
   /* "relate-db   PyPI · import relate · surfaces/relate-python" as {name, meta}. */
   function detectedLine(pkg) {
     var meta = [ECO_LABEL[pkg.ecosystem] || pkg.ecosystem];
-    if (pkg.import_name && pkg.import_name !== pkg.name) meta.push("import " + pkg.import_name);
+    if (pkg.ecosystem === "cli") { if (pkg.latest) meta.push("latest " + pkg.latest); }
+    else if (pkg.import_name && pkg.import_name !== pkg.name) meta.push("import " + pkg.import_name);
     if (pkg.path) meta.push(pkg.path);
     return { name: pkg.name, meta: meta.join(" · ") };
   }
@@ -318,7 +328,7 @@
     PHASES: PHASES, STATE_LBL: STATE_LBL, esc: esc, isHttp: isHttp, hostOf: hostOf,
     shortSrc: shortSrc, repoName: repoName, fmtAbs: fmtAbs, fmtAgo: fmtAgo, plural: plural,
     andList: andList, isDocsUrl: isDocsUrl, isRepo: isRepo, checkSources: checkSources,
-    alignPackages: alignPackages, detectedPicks: detectedPicks, detectedLine: detectedLine,
+    alignPackages: alignPackages, cliNeedsGithub: cliNeedsGithub, detectedPicks: detectedPicks, detectedLine: detectedLine,
     otherNote: otherNote, coverageView: coverageView, coverageSentence: coverageSentence,
     defaultName: defaultName, lastRun: lastRun, cardState: cardState,
     findingsDelta: findingsDelta, activityAt: activityAt, sortScans: sortScans,

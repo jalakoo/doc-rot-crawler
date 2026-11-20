@@ -325,10 +325,28 @@ def lanes(offline, monkeypatch, tmp_path):
         seen["lookups"].append((package, ecosystem))
         return [Release(label="1.0", released_at="2026-01-01")]
 
+    # the GitHub side of a standalone CLI: what its releases say, and the lane
+    import docrot.acquire.binaries as binaries
+    import docrot.verify.cli as cli_lane
+    seen["cli"] = []                   # (name, versions, repo_url, [snippet ids])
+    seen["asked"] = []                 # (repo, command) the scan looked up
+    seen["github"] = {}                # command -> CliLookup the fake GitHub answers with
+
+    def lookup(repo, name):
+        seen["asked"].append((repo, name))
+        return seen["github"].get(name) or binaries.CliLookup(
+            name, why=f"{repo} has no GitHub releases of {name}")
+
+    async def run_cli_matrix(snips, name, versions, cfg, log, *, repo_url="", install="", bins=()):
+        seen["cli"].append((name, versions, repo_url, sorted(s.id for s in snips)))
+        return lanes_result(snips, versions)
+
     monkeypatch.setattr(acq, "acquire_site", acquire_site)
     monkeypatch.setattr(acq, "releases", releases)
     monkeypatch.setattr(verify, "run_npm_matrix", run_npm_matrix)
     monkeypatch.setattr(dotnet, "run_dotnet_matrix", run_dotnet_matrix)
+    monkeypatch.setattr(binaries, "lookup", lookup)
+    monkeypatch.setattr(cli_lane, "run_cli_matrix", run_cli_matrix)
     seen["root"] = root
     return seen
 
@@ -613,3 +631,168 @@ def test_a_net_monorepo_is_capped_but_a_named_package_beyond_the_cap_is_kept(
     named = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/products"],
                                     packages=["Acme.P8"]), cfg, lambda m: None))
     assert [t["package"] for t in named.report["packages"]] == ["Acme.P8"]
+
+
+# ------------------------------------------------------- standalone CLI targets
+COMMANDS = "```bash\nrelate query \"MATCH (n) RETURN n\"\nrelate clone acme/graph\nrelate serve --port 80\n```\n"
+
+
+def _github(lanes, *labels, installable=True, **kw):
+    """The repo's GitHub releases: `labels` are versions, newest last."""
+    from docrot.acquire.binaries import CliLookup, CliRelease
+    lanes["github"]["relate"] = CliLookup(
+        "relate", [CliRelease(label=v, tag=f"v{v}", released_at=f"2026-0{i + 1}-01")
+                   for i, v in enumerate(labels)], installable=installable, **kw)
+
+
+def test_the_docs_running_the_command_and_a_release_binary_propose_a_cli_target(offline, lanes, cfg):
+    lanes["docs"] = RELATE_DOCS + COMMANDS
+    _github(lanes, "1.0.0", "1.1.0", "1.2.0")
+    lines = []
+    out = run(run_scan(_scan(options=ScanOptions(versions=2)), cfg, lines.append))
+
+    assert _targets(out) == [("relate-db", "pypi"), ("@relate/relate", "npm"),
+                             ("Relate.Net", "nuget"), ("relate", "cli")]
+    assert out.extraction.package == "relate-db"            # a package stays the primary
+    name, versions, repo, ids = lanes["cli"][0]
+    assert (name, versions, repo) == ("relate", ["1.1.0", "1.2.0"], "https://github.com/o/relate")
+    assert len(ids) == 1                                    # the three-line fence
+    assert not any(p == "relate" for p, _ in lanes["npm"])  # and the npm lane never sees it
+    assert set(lanes["asked"]) == {("https://github.com/o/relate", "relate")}   # one repo, one command
+    assert any("3 `relate` command lines" in line and "standalone CLI" in line for line in lines)
+    assert any(line.strip() == "relate (cli) · 3 releases · testing 1.1.0, 1.2.0" for line in lines)
+
+
+def test_two_command_lines_are_not_enough_and_cost_no_github_request(offline, lanes, cfg):
+    lanes["docs"] = RELATE_DOCS + "```bash\nrelate query a\nrelate clone b\n```\n"
+    _github(lanes, "1.0.0")
+    out = run(run_scan(_scan(), cfg, lambda m: None))
+    assert ("relate", "cli") not in _targets(out)
+    assert lanes["asked"] == []
+
+
+def test_prose_about_the_command_is_not_a_command_line(offline, lanes, cfg):
+    lanes["docs"] = RELATE_DOCS + "Run relate query, relate clone and relate serve. `relate query` is fast.\n"
+    _github(lanes, "1.0.0")
+    out = run(run_scan(_scan(), cfg, lambda m: None))
+    assert ("relate", "cli") not in _targets(out) and lanes["asked"] == []
+
+
+def test_a_github_that_cannot_be_asked_skips_the_cli_and_never_fails_the_scan(offline, lanes, cfg):
+    from docrot.acquire.binaries import RATE_LIMITED, CliLookup
+    lanes["docs"] = RELATE_DOCS + COMMANDS
+    lanes["github"]["relate"] = CliLookup("relate", why=RATE_LIMITED, failed=True)
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert ("relate", "cli") not in _targets(out) and lanes["cli"] == []
+    assert len(out.report["packages"]) == 3
+    skipped = next(line for line in lines if "not verifying relate as a standalone CLI" in line)
+    assert "rate limit" in skipped and "GITHUB_TOKEN" in skipped and "cli:relate" in skipped
+
+
+def test_a_repo_with_no_installable_binary_is_not_proposed_and_says_why(offline, lanes, cfg):
+    lanes["docs"] = RELATE_DOCS + COMMANDS
+    _github(lanes, "1.0.0", installable=False,
+            why="none of the newest 1 releases of relate carries a Linux binary docrot can install")
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert ("relate", "cli") not in _targets(out)
+    assert any("Linux binary docrot can install" in line for line in lines)
+
+
+def test_an_npm_package_that_declares_the_bin_owns_the_command_and_no_cli_is_proposed(
+        offline, lanes, cfg):
+    (lanes["root"] / "js" / "package.json").write_text(
+        '{"name": "@relate/relate", "version": "1.0.0", "bin": {"relate": "cli.js"}}')
+    lanes["docs"] = RELATE_DOCS + COMMANDS
+    _github(lanes, "1.0.0")
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert ("relate", "cli") not in _targets(out) and lanes["asked"] == []
+    assert any("ships that bin" in line and "@relate/relate" in line for line in lines)
+    assert lanes["npm"] and lanes["npm"][0][1] >= 1         # the commands went to the npm lane
+
+
+def test_the_commands_of_an_npm_package_without_a_bin_are_not_structural_for_it(offline, lanes, cfg):
+    """330 `relate ...` snippets were counted as `@relate/relate`'s."""
+    lanes["docs"] = RELATE_DOCS + COMMANDS
+    out = run(run_scan(_scan(), cfg, lambda m: None))      # no CLI target: GitHub knows nothing
+    cmd = next(s for s in out.extraction.snippets if s.code.startswith("relate query"))
+    assert (cmd.tier, cmd.reason) == ("unverifiable", "no-package-use")
+
+
+def test_naming_cli_adds_it_without_the_docs_proof_and_restricts_the_repo(offline, lanes, cfg):
+    lanes["docs"] = RELATE_DOCS
+    _github(lanes, "1.0.0", "1.1.0")
+    out = run(run_scan(_scan(packages=["cli:relate"]), cfg, lambda m: None))
+    assert _targets(out) == [("relate", "cli")]             # naming restricts: no automatic packages
+    assert out.extraction.package == "relate"               # nothing else to be primary
+    assert lanes["npm"] == [] and lanes["dotnet"] == []
+
+
+def test_a_named_cli_goes_after_the_package_named_with_it(offline, lanes, cfg):
+    _github(lanes, "1.0.0")
+    out = run(run_scan(_scan(packages=["relate-db", "cli:relate"]), cfg, lambda m: None))
+    assert _targets(out) == [("relate-db", "pypi"), ("relate", "cli")]
+
+
+def test_a_cli_entry_after_the_last_repo_goes_to_the_first_github_repo(offline, lanes, cfg):
+    _github(lanes, "1.0.0")
+    out = run(run_scan(_scan(repos=["https://github.com/o/relate"],
+                             packages=["npm:@relate/relate", "cli:relate"]), cfg, lambda m: None))
+    assert _targets(out) == [("@relate/relate", "npm"), ("relate", "cli")]
+
+
+def test_a_cli_on_a_repo_that_is_not_github_is_refused_by_name_and_the_rest_goes_on(offline, lanes, cfg):
+    lines = []
+    out = run(run_scan(_scan(repos=["https://gitlab.com/o/relate"], packages=["cli:relate"]),
+                       cfg, lines.append))
+    assert ("relate", "cli") not in _targets(out)
+    refusal = next(line for line in lines if "cli:relate cannot be taken from https://gitlab.com/o/relate" in line)
+    assert "GitHub repository's releases" in refusal
+
+
+def test_a_cli_that_is_all_the_scan_asked_for_and_cannot_be_had_fails_it(offline, lanes, cfg):
+    with pytest.raises(ScanError) as e:
+        run(run_scan(_scan(repos=[], docs=["https://a.io"], packages=["cli:relate"]), cfg, lambda m: None))
+    assert "needs the GitHub repository that publishes its release binaries" in str(e.value)
+
+
+def test_a_cli_with_no_repo_at_all_fails_the_scan_saying_exactly_that(offline, lanes, cfg):
+    with pytest.raises(ScanError) as e:
+        run(run_scan(ScanInputs(docs=["https://a.io"], packages=["cli:relate"]), cfg, lambda m: None))
+    assert "needs the GitHub repository that publishes its release binaries" in str(e.value)
+
+
+def test_a_named_cli_the_releases_cannot_supply_fails_alone_and_is_skipped_beside_others(
+        offline, lanes, cfg):
+    """Nothing else to verify: the scan says so. Beside a package: it logs and goes on."""
+    with pytest.raises(ScanError) as e:
+        run(run_scan(_scan(packages=["cli:relate"]), cfg, lambda m: None))
+    assert "cli:relate not verified: https://github.com/o/relate has no GitHub releases of relate" in str(e.value)
+    lines = []
+    out = run(run_scan(_scan(packages=["relate-db", "cli:relate"]), cfg, lines.append))
+    assert _targets(out) == [("relate-db", "pypi")]
+    assert any("! cli:relate not verified: " in line for line in lines)
+
+
+def test_a_cli_named_like_a_package_already_in_the_scan_is_skipped_not_merged(offline, lanes, cfg):
+    """Results, snippets and the graph are keyed by package name alone."""
+    _github(lanes, "1.0.0")
+    lines = []
+    out = run(run_scan(_scan(packages=["relate-db", "pypi:relate", "cli:relate"]), cfg, lines.append))
+    assert ("relate", "cli") not in _targets(out)
+    assert any("cli:relate not verified: relate (pypi) already goes by that name" in line for line in lines)
+
+
+def test_a_cli_target_has_no_head_symbols_and_the_graph_is_told_so(offline, lanes, cfg):
+    _github(lanes, "1.0.0")
+    run(run_scan(_scan(packages=["relate-db", "cli:relate"]), cfg, lambda m: None))
+    packages, head = offline["graph"]
+    assert packages == ["relate-db", "relate"] and "relate" in head
+
+
+def test_cli_versions_are_spread_across_major_lines(offline, lanes, cfg):
+    _github(lanes, "1.0.0", "1.1.0", "1.1.1", "2.0.0", "2.0.1")
+    run(run_scan(_scan(packages=["cli:relate"], options=ScanOptions(versions=2)), cfg, lambda m: None))
+    assert lanes["cli"][0][1] == ["1.1.1", "2.0.1"]       # the newest of each major line, oldest first

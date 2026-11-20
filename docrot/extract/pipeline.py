@@ -7,31 +7,38 @@ replayable offline.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from ..config import Config
 from ..models import REASONS, UNRECORDED, Claim, Extraction, PackageRef, Page, Snippet, coverage
 from . import claims as claims_mod
 from . import csharp, fences, javascript, llm, symbols, tiers
+from .commands import Ownership
 
 
 def extract(pages: list[Page], packages: Sequence[PackageRef], cfg: Config,
             log=print, assume_credentialed: bool = False,
-            head_symbols: set[str] | None = None) -> Extraction:
+            head_symbols: set[str] | None = None,
+            bins: Mapping[str, Sequence[str]] | None = None) -> Extraction:
+    """`bins` is what each npm package's HEAD package.json declares, by package
+    name: the commands it owns. A package missing from it was never read
+    (registry-only), and keeps owning the command named like it."""
     if not packages:
         raise ValueError("extract needs at least one package")
     primary = packages[0]
-    import_names = [p.import_name for p in packages]
+    # a standalone CLI is not importable: its command name must not claim
+    # `import relate` from the Python package that is called the same
+    import_names = [p.import_name for p in packages if p.ecosystem != "cli"]
 
     snips = fences.parse(pages)
     log(f"  {len(snips)} code fences parsed")
 
-    npm = [p.import_name for p in packages if p.ecosystem == "npm" and p.import_name]
-    symbols.annotate(snips, import_names, npm_packages=npm)
+    own = Ownership.of(packages, bins)
+    symbols.annotate(snips, import_names, npm_packages=list(own.npm), own=own)
     tiers.assign(snips, set(cfg.sandbox_env.keys()), import_names,
-                 assume_credentialed, npm_packages=npm)
-    attribute(snips, packages)
-    match_languages(snips, packages)
+                 assume_credentialed, npm_packages=list(own.npm), own=own)
+    attribute(snips, packages, own)
+    match_languages(snips, packages, own)
     prune_declares(snips, head_symbols or set())
 
     # Lexical claim binding: no embedding service (S4: precision 1.00,
@@ -150,25 +157,30 @@ def prune_declares(snippets: list[Snippet], head_symbols: set[str]) -> None:
             s.tier = tiers.skip(s, "not-declared")
 
 
-def attribute(snippets: list[Snippet], packages: Sequence[PackageRef]) -> None:
+def attribute(snippets: list[Snippet], packages: Sequence[PackageRef],
+              own: Ownership | None = None) -> None:
     """Which package each snippet is verified against.
 
     The first package the snippet names wins: an imported symbol root, an
     `import x` line, a `pip install x` token, or - for npm - a module
     specifier, an `npm install x` token or a CLI it runs. A snippet naming none
     of them goes to the primary package, which is what a single-package scan
-    always did.
+    always did. A command line belongs to whoever owns the command
+    (`commands.Ownership`), never to a package that merely shares its name.
     """
-    by_import = {p.import_name: p.package for p in packages}
-    by_dist = {_norm(p.package): p.package for p in packages}
+    importable = [p for p in packages if p.ecosystem != "cli"]
+    by_import = {p.import_name: p.package for p in importable}
+    by_dist = {_norm(p.package): p.package for p in importable}
     npm = {p.import_name: p.package for p in packages if p.ecosystem == "npm"}
+    own = own or Ownership.of(packages)
     for s in snippets:
-        s.package = _owner(s, by_import, by_dist, npm) or packages[0].package
+        s.package = _owner(s, by_import, by_dist, npm, own) or packages[0].package
 
 
 def _owner(s: Snippet, by_import: dict[str, str], by_dist: dict[str, str],
-           npm: dict[str, str] | None = None) -> str:
+           npm: dict[str, str] | None = None, own: Ownership | None = None) -> str:
     npm = npm or {}
+    own = own or Ownership(list(npm))
     if npm and javascript.is_js(s.lang):
         # Specifiers, not symbol strings: `socket.io.Server` cannot be told
         # apart from `socket` + `io.Server` once it is joined with dots.
@@ -181,7 +193,10 @@ def _owner(s: Snippet, by_import: dict[str, str], by_dist: dict[str, str],
             name = re.split(r"[\[=<>~!]", sym[4:], maxsplit=1)[0]
             if _norm(name) in by_dist:
                 return by_dist[_norm(name)]
-        elif sym.startswith(("npm:", "cli:")):
+        elif sym.startswith("cli:"):
+            if pkg := own.owner(s.code):
+                return pkg
+        elif sym.startswith("npm:"):
             if pkg := _npm_token_owner(sym, npm):
                 return pkg
         elif imp := _root(sym, by_import, set(npm)):
@@ -228,10 +243,13 @@ def _root(sym: str, by_import: dict[str, str], npm: set[str] | None = None) -> s
     return max(hits, key=len) if hits else ""
 
 
-LANGUAGE = {"pypi": "python", "npm": "javascript", "nuget": "csharp"}
+# a `cli` target is checked through shell commands and nothing else
+LANGUAGE = {"pypi": "python", "npm": "javascript", "nuget": "csharp", "cli": "shell"}
+_CODE_LANGUAGES = frozenset({"python", "javascript", "csharp"})     # the families a fence can be in
 
 
-def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef]) -> None:
+def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef],
+                    own: Ownership | None = None) -> None:
     """A snippet can only be checked against a package in its own language.
 
     A C# block attributed to a Python package - or a Python block to a NuGet
@@ -239,24 +257,29 @@ def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef]) -> 
     the other reports nothing true, so it is marked unverifiable instead.
 
     Shell is neutral, but not free: its lane is its package's ecosystem. A
-    block attributed to an npm package must install or run that package, and
-    one carrying only npm tokens stays out of a PyPI lane.
+    block attributed to an npm package must install or run that package, one
+    attributed to a standalone CLI must run its command, and one carrying only
+    npm tokens stays out of a PyPI lane.
     """
     eco = {p.package: p.ecosystem for p in packages}
     npm = {p.import_name: p.package for p in packages if p.ecosystem == "npm"}
+    own = own or Ownership.of(packages)
     for s in snippets:
         if s.tier == "unverifiable":
             continue
         ecosystem = eco.get(s.package, "pypi")
         want = LANGUAGE.get(ecosystem, "")
         lang = fences.family(s.lang)
-        if lang in LANGUAGE.values():
+        if lang in _CODE_LANGUAGES:
             if lang != want:
                 s.tier = tiers.skip(s, "other-language")
         elif want == "csharp":
             s.tier = tiers.skip(s, "no-package-use")
+        elif want == "shell":
+            if s.package not in own.owners(s.code):
+                s.tier = tiers.skip(s, "no-package-use")
         elif want == "javascript":
-            if not _names_npm(s, s.package, npm):
+            if not (_names_npm(s, s.package, npm) or s.package in own.owners(s.code)):
                 s.tier = tiers.skip(s, "no-package-use")
         elif _names_npm_only(s):
             s.tier = tiers.skip(s, "other-language")
@@ -264,7 +287,7 @@ def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef]) -> 
 
 def _names_npm(s: Snippet, package: str, npm: dict[str, str]) -> bool:
     return any(_npm_token_owner(sym, npm) == package for sym in s.symbols
-               if sym.startswith(("npm:", "cli:")))
+               if sym.startswith("npm:"))
 
 
 def _names_npm_only(s: Snippet) -> bool:

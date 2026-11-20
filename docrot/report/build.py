@@ -47,6 +47,16 @@ def _code_url(repo_url: str, branch: str, path: str, line: int = 0) -> str:
     return f"{base}/blob/{branch}/{path}{anchor}"
 
 
+def _module_url(ex: Target, repo_url: str, branch: str) -> str:
+    """Where the code a Python-introspection finding is about lives. A
+    standalone CLI has no `<import>/__init__.py` - linking one would be a
+    404 - so it gets the repo's release page."""
+    if ex.ecosystem == "cli":
+        from ..acquire.binaries import release_page
+        return release_page(repo_url) if repo_url else ""
+    return _code_url(repo_url, branch, f"{ex.import_name}/__init__.py")
+
+
 def _probe_json(stderr: str) -> dict:
     m = re.search(r"\{[\s\S]*\"probe\"[\s\S]*\}", stderr or "")
     if not m:
@@ -95,11 +105,14 @@ def build_report(ex: Extraction, results: list[Result], targets: list[Target],
                         if pin in s.code), None)
             doc_line = src.line if src else 0
             npm = t.ecosystem == "npm"      # `pkg@1.2.3`, not `pkg==1.2.3`
+            cli = t.ecosystem == "cli"      # a release tag in a download URL or a version flag
             base = (src.code if src else
-                    (f"npm install {t.package}@{pin}" if npm else f"install {t.package}=={pin}")).strip()
-            m = (re.match(rf"(.*?@)({re.escape(pin)})(.*)", base, re.S) if npm else PIN_RE.match(base))
+                    (f"npm install {t.package}@{pin}" if npm else
+                     f"{t.package} {pin}" if cli else f"install {t.package}=={pin}")).strip()
+            m = (re.match(rf"(.*?@)({re.escape(pin)})(.*)", base, re.S) if npm else
+                 re.match(rf"(.*?)({re.escape(pin)})(.*)", base, re.S) if cli else PIN_RE.match(base))
             head, tail = (m.group(1), m.group(3)) if m else (base, "")
-            old_at, new_at = ((pin, latest.label) if npm else (f"=={pin}", f"=={latest.label}"))
+            old_at, new_at = ((pin, latest.label) if npm or cli else (f"=={pin}", f"=={latest.label}"))
             found.append(Finding(
                 kind="stale_pin", label="version pin", line=doc_line,
                 snippet=src.id if src else "",
@@ -115,15 +128,18 @@ def build_report(ex: Extraction, results: list[Result], targets: list[Target],
                 doc_where=f"{page.path} · line {doc_line}" if doc_line else page.path,
                 doc_url=page.url, doc_stamp_label="docs pin",
                 doc_stamp=f"{pin}" + (f" · {match.released_at}" if match else ""),
-                code_where="package.json / registry" if npm else "pyproject.toml / registry",
-                code_url=_code_url(repo_url, branch, "package.json" if npm else "pyproject.toml"),
+                code_where=("GitHub releases" if cli else
+                            "package.json / registry" if npm else "pyproject.toml / registry"),
+                code_url=(_module_url(t, repo_url, branch) if cli else
+                          _code_url(repo_url, branch, "package.json" if npm else "pyproject.toml")),
                 code_stamp_label="current release",
                 code_stamp=f"{latest.label}" +
                            (f" · {latest.released_at}" if latest.released_at else ""),
                 doc_parts=[[head, "same"], [old_at, "del"], [tail, "same"]],
                 code_parts=[[head, "same"], [new_at, "ins"], [tail, "same"]],
                 damage="-1 RELEASE", days_behind=gap,
-                evidence=_pin_evidence(t.package, releases, pin, latest),
+                evidence=_pin_evidence(t.package, releases, pin, latest,
+                                       "GitHub releases" if cli else "registry"),
                 chips=[["tier-struct", "structural"], ["st-drift", "stale pin"],
                        ["", "no creds needed"]],
                 sprite="mimic",
@@ -202,8 +218,8 @@ def _page_target(page: Page, snips: list, targets: list[Target]) -> Target:
     return targets[0]
 
 
-def _pin_evidence(pkg, releases, pin, latest) -> str:
-    lines = [f"registry  {pkg}"]
+def _pin_evidence(pkg, releases, pin, latest, source: str = "registry") -> str:
+    lines = [f"{source}  {pkg}"]
     for r in releases[-8:]:
         tag = ""
         if _norm(r.label) == _norm(pin):
@@ -218,7 +234,7 @@ def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Tar
     probe = _probe_json(r.stderr)
     if probe.get("compiler") is not None:
         return _from_compiler(s, probe, page, failing, labels, repo_url, branch, latest, ex)
-    if probe.get("npm"):          # an empty list is a pass record: fall through
+    if probe.get("npm") or probe.get("cli"):     # an empty list is a pass record: fall through
         return _from_npm(s, probe, page, failing, labels, repo_url, branch, latest, ex)
     fails = probe.get("failed") or []
     blob = "\n".join(fails) if fails else (r.stderr or "")
@@ -267,7 +283,7 @@ def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Tar
             page=page.url, doc_where=f"{page.path} · {s.id}", doc_url=page.url,
             doc_stamp_label="docs import from", doc_stamp=ex.import_name,
             code_where=f"actual location · {failing[0]}",
-            code_url=_code_url(repo_url, branch, f"{ex.import_name}/__init__.py"),
+            code_url=_module_url(ex, repo_url, branch),
             code_stamp_label="code is at",
             code_stamp=f"{latest.label} · {latest.released_at}",
             doc_parts=[[f"from {ex.import_name} import ", "same"], [fn, "del"]],
@@ -291,7 +307,7 @@ def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Tar
             page=page.url, doc_where=f"{page.path} · {s.id}", doc_url=page.url,
             doc_stamp_label="docs declare", doc_stamp=f"{fn}()",
             code_where=f"{ex.import_name} · exports",
-            code_url=_code_url(repo_url, branch, f"{ex.import_name}/__init__.py"),
+            code_url=_module_url(ex, repo_url, branch),
             code_stamp_label="code is at", code_stamp="name absent",
             doc_parts=[[s.code[:300], "del"]],
             code_parts=[[f"AttributeError: no attribute '{fn}'", "void"]],
@@ -348,8 +364,7 @@ def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Tar
             doc_stamp_label="docs reflect",
             doc_stamp="unreleased work" if everywhere else "an earlier release",
             code_where=f"{ex.import_name} · exports",
-            code_url=_code_url(repo_url, branch,
-                               f"{ex.import_name}/__init__.py"),
+            code_url=_module_url(ex, repo_url, branch),
             code_stamp_label="code is at", code_stamp="symbol absent",
             doc_parts=[[s.code[:300], "same"]],
             code_parts=[[f"{kind}: {msg}"[:220], "void"]],
@@ -463,6 +478,15 @@ def _npm_url(repo_url: str, package: str, latest) -> str:
     return f"https://www.npmjs.com/package/{package}{tail}"
 
 
+def _release_url(repo_url: str, probe: dict, version: str) -> str:
+    """The release page of the version a standalone CLI was checked at: the tag
+    the lane installed from when it says, else the repo's release list."""
+    from ..acquire.binaries import release_page
+    meta = probe.get("probe") or {}
+    tag = str(meta.get("tag") or "") if str(meta.get("version") or "") == version else ""
+    return release_page(repo_url, tag) if repo_url else ""
+
+
 def _npm_title(check: str, scenario: str) -> tuple[str, str]:
     """(label, title) for a check kind in each cross-version scenario."""
     if scenario == "newer":
@@ -495,7 +519,8 @@ def _from_npm(s, probe, page, failing, labels, repo_url, branch, latest, ex: Tar
     everywhere says nothing was ever true - and for a flag that is stated as
     "absent from the CLI's own --help", never as "removed".
     """
-    found = probe["npm"]
+    cli_lane = bool(probe.get("cli"))        # a standalone binary, not an npm package
+    found = probe["cli"] if cli_lane else probe["npm"]
     first = found[0]
     check = str(first.get("check", "runtime"))
     kind, damage, sprite, noun = _NPM_CHECKS.get(check, _NPM_CHECKS["runtime"])
@@ -542,7 +567,9 @@ def _from_npm(s, probe, page, failing, labels, repo_url, branch, latest, ex: Tar
         page=page.url, doc_where=f"{page.path} · {s.id}" + (f" · line {line}" if line else ""),
         doc_url=page.url, doc_stamp_label="docs hold on",
         doc_stamp=", ".join(passing) or "no release tested",
-        code_where=where, code_url=_npm_url(repo_url, ex.package, latest),
+        code_where=where,
+        code_url=(_release_url(repo_url, probe, failing[0]) if cli_lane
+                  else _npm_url(repo_url, ex.package, latest)),
         code_stamp_label="code is at",
         code_stamp=f"{latest.label} · {latest.released_at}" if latest.released_at else latest.label,
         doc_parts=[[src.strip()[:300], "del"]],
@@ -588,6 +615,7 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
         )
     s = snips[0]
     npm = ex.ecosystem == "npm"
+    cli = ex.ecosystem == "cli"
     if not checked:
         tiers = sorted({x.tier for x in snips})
         why = _why_unchecked(snips)
@@ -619,18 +647,21 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
         page=page.url, doc_where=f"{page.path} · {len(snips)} snippets",
         doc_url=page.url, doc_stamp_label="docs reflect",
         doc_stamp=f"{latest.label} · current",
-        code_where=f"{ex.package} · installed and probed" if npm else f"{ex.import_name} · introspected",
-        code_url=(_npm_url(repo_url, ex.package, latest) if npm
-                  else _code_url(repo_url, branch, f"{ex.import_name}/__init__.py")),
+        code_where=(f"{ex.package} · release binary, --help read" if cli else
+                    f"{ex.package} · installed and probed" if npm else f"{ex.import_name} · introspected"),
+        code_url=(_npm_url(repo_url, ex.package, latest) if npm else _module_url(ex, repo_url, branch)),
         code_stamp_label="code is at",
         code_stamp=f"{latest.label} · {latest.released_at}",
         doc_parts=[[s.code[:300], "same"]],
-        code_parts=[[("every module loaded and every export found\nCLI commands and flags "
+        code_parts=[[("every documented command and flag appears in the\nbinary's own --help; "
+                      "nothing was executed") if cli else
+                     ("every module loaded and every export found\nCLI commands and flags "
                       "appear in the CLI's own --help") if npm else
                      "all referenced symbols resolved\nsignatures accept the "
                      "documented arguments", "same"]],
         damage="NO DAMAGE", days_behind=0,
-        evidence=("probe: modules loaded, exports found, CLI help consulted\ndrift: none" if npm
+        evidence=("probe: --help consulted, no command run\ndrift: none" if cli else
+                  "probe: modules loaded, exports found, CLI help consulted\ndrift: none" if npm
                   else "probe: all symbols resolved\ndrift: none"),
         chips=[["tier-struct", s.tier], ["st-pass", "no drift"], ["", "clean"]],
         sprite="none",

@@ -281,3 +281,70 @@ def test_a_pass_record_with_an_empty_npm_list_falls_through_to_the_generic_path(
     r = build_report(ex, results, [t], ["https://d.io"], [], "llms.txt", 1.0)
     [f] = [f for sec in r["sections"] for p in sec["pages"] for f in p["findings"]]
     assert f["kind"] == "runtime" and f["title"] == "SNIPPET FAILS WHEN RUN"
+
+
+# ------------------------------------------------- standalone CLI findings (the binary lane)
+CLI_V = [Release(label="1.1.0", released_at="2026-11-17"), Release(label="1.2.0", released_at="2026-11-20")]
+CLI_FINDING = {
+    "command": {"check": "command", "subject": "relate extension instal", "line": 1,
+                "message": "'instal' is not among the commands `relate extension --help` lists "
+                           "(check, init, install, list, remove); did you mean 'install'?",
+                "detail": "Usage: relate extension init <name>"},
+    "flag": {"check": "flag", "subject": "relate serve --readonly", "line": 1,
+             "message": "--readonly does not appear in `relate serve --help` and nowhere in the binary",
+             "detail": "Usage: relate serve --database PATH"},
+    "bin": {"check": "bin", "subject": "rl", "line": 1, "message": "no such bin", "detail": ""},
+}
+CLI_CODE = {"command": "relate extension instal greet", "flag": "relate serve --http 7474 --readonly",
+            "bin": "rl go"}
+
+
+def _cli_report(check: str, statuses: list[str], repo: str = "https://github.com/relatedb/relate"):
+    t = Target(package="relate", import_name="relate", ecosystem="cli", repo_url=repo, branch="main",
+               releases=list(CLI_V), versions=list(CLI_V))
+    page = Page(url="https://d.io/x/cli", path="/x/cli", title="CLI", origin="https://d.io")
+    s = Snippet(id="s1", page=page.url, lang="bash", code=CLI_CODE[check], package="relate", line=12)
+    f = CLI_FINDING[check]
+
+    def body(v: str, rows: list) -> str:
+        return json.dumps({"probe": {"lane": "cli", "tool": "relate", "version": v, "tag": f"v{v}"},
+                           "cli": rows, "failed": [f"{r['subject']}: {r['message']}" for r in rows], "notes": []})
+
+    results = [Result(id="s1", page=page.url, version=v.label, package="relate", status=st,
+                      stderr=body(v.label, [f] if st == "fail" else []))
+               for v, st in zip(CLI_V, statuses, strict=True)]
+    ex = Extraction(package="relate", import_name="relate", ecosystem="cli", pages=[page], snippets=[s])
+    r = build_report(ex, results, [t], ["https://d.io"], [], "llms.txt", 1.0)
+    return [f for sec in r["sections"] for p in sec["pages"] for f in p["findings"]]
+
+
+@pytest.mark.parametrize("check", ["command", "flag", "bin"])
+def test_cli_findings_read_like_the_npm_lanes_and_link_the_release_that_was_checked(check):
+    [f] = [f for f in _cli_report(check, ["pass", "fail"]) if f["kind"] in KINDS.values()]
+    assert f["kind"] == KINDS[check] and "1.1.0" in f["desc"] and "no longer" in f["desc"]
+    assert f["code_url"] == "https://github.com/relatedb/relate/releases/tag/v1.2.0"
+    assert f["code_parts"][0][0] == CLI_FINDING[check]["message"][:300]
+    assert "npmjs.com" not in json.dumps(f) and "__init__" not in json.dumps(f)
+
+
+def test_cli_titles_match_the_npm_lane_for_the_same_check_and_scenario():
+    def title(check, statuses):
+        return next(f for f in _cli_report(check, statuses) if f["kind"] in KINDS.values())["title"]
+
+    assert title("command", ["pass", "fail"]) == "DOCUMENTS A COMMAND THE CLI NO LONGER HAS"
+    assert title("command", ["fail", "pass"]) == "REQUIRES A NEWER RELEASE"
+    assert title("command", ["fail", "fail"]) == "DOCUMENTS A COMMAND NO RELEASE HAS"
+    assert title("flag", ["pass", "fail"]) == "DOCUMENTS A FLAG THE CLI DOES NOT ACCEPT"
+
+
+def test_a_cli_flag_absent_everywhere_names_the_cli_help_and_the_release_it_was_checked_on():
+    [f] = [f for f in _cli_report("flag", ["fail", "fail"]) if f["kind"] == "signature"]
+    assert "absent from the CLI's own" in f["desc"] and "removed" not in f["desc"]
+    assert f["code_where"] == "relate --help · 1.1.0"
+    assert f["code_url"] == "https://github.com/relatedb/relate/releases/tag/v1.1.0"   # the first release it failed on
+    assert "nowhere in the binary" in f["evidence"]
+
+
+def test_a_cli_finding_without_a_repo_has_no_link_rather_than_a_registry_one():
+    [f] = [f for f in _cli_report("command", ["pass", "fail"], repo="") if f["kind"] == "missing_symbol"]
+    assert f["code_url"] == ""

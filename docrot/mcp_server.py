@@ -183,7 +183,7 @@ class RenameImpact(BaseModel):
 
 class DetectedPackage(BaseModel):
     name: str
-    ecosystem: str = Field(description="pypi, npm or nuget")
+    ecosystem: str = Field(description="pypi, npm, nuget, or cli (a standalone command-line tool whose binaries the repo releases on GitHub)")
     import_name: str
     path: str = Field(description="folder inside the repo; empty for the root")
     spec: str = Field(description="<ecosystem>:<name>: pass this in start_scan's packages to verify exactly it")
@@ -471,7 +471,8 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
         """Which publishable packages a repo holds, found by reading its manifests.
 
         Call this BEFORE start_scan on a repo you do not know: monorepos ship
-        several packages (e.g. PyPI + npm + NuGet) and a scan can only verify
+        several packages (e.g. PyPI + npm + NuGet, or a standalone CLI installed
+        from GitHub release binaries - `cli:name`) and a scan can only verify
         what it is pointed at. Pass the `spec` of the ones you want as
         start_scan's `packages` (positionally: packages[i] for repos[i]); name
         none and the scan picks the found packages the docs mention (at most 6 per repo; if the docs
@@ -495,7 +496,7 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
             entry = DetectedRepo(**found)
             if not entry.error and not entry.packages:
                 entry.note = ("No package found. If the repo has one, name it in start_scan's packages "
-                              "(with the ecosystem set, or as pypi:/npm:/nuget:name).")
+                              "(with the ecosystem set, or as pypi:/npm:/nuget:name; cli:name for a standalone tool).")
             out.append(entry)
         return reply(Detected(repos=out))
 
@@ -508,13 +509,15 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
             "if packages names what to check"))],
         packages: Annotated[list[str] | None, Field(description=(
             "package names, matched to repos by position: packages[0] belongs to repos[0]. A name may carry "
-            "an ecosystem prefix - pypi:relate-db, npm:@relate/relate, nuget:Relate.Net (see "
-            "detect_packages, whose `spec` is exactly this). Naming restricts: if any entry names a package "
+            "an ecosystem prefix - pypi:relate-db, npm:@relate/relate, nuget:Relate.Net, or cli:relate for a "
+            "standalone command-line tool installed from the repo's GitHub release binaries, which needs a "
+            "GitHub repo in repos (see detect_packages, whose `spec` is exactly this). Naming restricts: if any entry names a package "
             "found in a repo, that repo verifies exactly the named ones (extra entries past the last repo "
             "may also name a package of an earlier repo, to verify several from one); if none is named for "
             "a repo, docrot picks the packages found there that the docs mention (install commands, imports, "
-            "using lines, distinctive names), most mentioned first, at most 6 per repo; named packages are "
-            "never capped. Use \"\" to "
+            "using lines, distinctive names), most mentioned first, at most 6 per repo, plus a standalone CLI named like the "
+            "repo when the docs show at least 3 of its command lines and the releases carry a Linux binary; named "
+            "packages are never capped. Use \"\" to "
             "leave a repo's slot unnamed. An entry naming no package of any repo is fetched from the "
             "registry; one name on two registries is verified once, on the first. Omit to infer everything"))] = None,
         name: Annotated[str | None, Field(description="display name; default: derived from the first source")] = None,

@@ -43,9 +43,11 @@ if TYPE_CHECKING:
 # docs. npm needs it because the busy packages (momentic is past 3.74) cut a
 # release every few days and neighbours are nearly identical - the newest N
 # would all agree, while the newest of each major line is where renamed or
-# removed commands and exports actually show. PyPI keeps the plain newest-N:
-# its docs usually track the current minor.
-SPREAD_ECOSYSTEMS = frozenset({"nuget", "npm"})
+# removed commands and exports actually show. A standalone CLI is the same
+# case: Relate cut 1.1.0 and 1.2.0 days apart, and a subcommand is renamed at
+# a minor or major boundary, not between patches. PyPI keeps the plain
+# newest-N: its docs usually track the current minor.
+SPREAD_ECOSYSTEMS = frozenset({"nuget", "npm", "cli"})
 
 # Most packages one repo contributes when the scan names none of them. A .NET
 # monorepo ships 28 (Duende's); every package is a sandbox per version tested,
@@ -54,6 +56,10 @@ SPREAD_ECOSYSTEMS = frozenset({"nuget", "npm"})
 MAX_AUTO_PACKAGES = 6
 
 Log = Callable[[str], None]
+
+
+def _tail(name: str) -> str:
+    return name.rsplit("/", 1)[-1]
 
 
 class ScanError(Exception):
@@ -112,7 +118,7 @@ def _import_name(package: str, ecosystem: str, found: str = "") -> str:
     """What `import`/`require` calls the package. PyPI distributions swap `-` for
     `_` and NuGet carries its own namespace; an npm package is imported by the
     very name it is published under."""
-    if ecosystem == "npm":
+    if ecosystem in ("npm", "cli"):
         return package
     return found or package.replace("-", "_")
 
@@ -311,6 +317,98 @@ def _automatic(path: Path, name: str, corpus: str, found: list[Package],
     return pick.chosen
 
 
+def _ships_bin(targets: list[Target], bins: dict[str, tuple[str, ...]], command: str) -> str:
+    """The npm target that already puts `command` on the PATH, or "".
+
+    A package whose HEAD package.json declares the bin owns the command. One
+    nobody has read (registry-only) is guessed at by its unscoped name, as the
+    extraction does - a Relate-style repo whose `@relate/relate` declares no bin
+    is the case this exists to get right."""
+    for t in targets:
+        if t.ecosystem != "npm":
+            continue
+        declared = bins.get(t.package)
+        if (command in declared) if declared is not None else _tail(t.package) == command:
+            return t.package
+    return ""
+
+
+def _github_repo(repo: str) -> bool:
+    from .acquire.binaries import github_slug
+    return github_slug(repo) is not None
+
+
+def _cli_homes(repos: list[str], entries: list[tuple[str, str]]) -> tuple[dict[int, list[str]], list[str]]:
+    """Which repo each `cli:` entry belongs to, and the entries no repo can take.
+
+    An entry at a repo's own position belongs to that repo (and must be a GitHub
+    one); the ones after the last repo - where the form's extra picks land - go
+    to the first GitHub repo, because a command has no registry to be found in."""
+    homes: dict[int, list[str]] = {}
+    refused: list[str] = []
+    first = next((i for i, r in enumerate(repos) if _github_repo(r)), None)
+    for j, (eco, name) in enumerate(entries):
+        if eco != "cli" or not name:
+            continue
+        i = j if j < len(repos) else first
+        if i is None:
+            refused.append(f"cli:{name} needs the GitHub repository that publishes its release "
+                           "binaries, and the scan has none")
+        elif not _github_repo(repos[i]):
+            refused.append(f"cli:{name} cannot be taken from {repos[i]}: docrot installs a "
+                           "command-line tool from a GitHub repository's releases")
+        else:
+            homes.setdefault(i, []).append(name)
+    return homes, refused
+
+
+def _cli_target(lookup, name: str, repo: str, branch: str, commit: str) -> Target | None:
+    """A CLI target for `name`, or None when the repo's releases cannot supply it."""
+    if not lookup.installable:
+        return None
+    return Target(package=name, import_name=name, ecosystem="cli", repo_url=repo,
+                  branch=branch, commit=commit)
+
+
+async def _auto_cli(repo: str, name: str, pages: list, targets: list[Target],
+                    bins: dict[str, tuple[str, ...]], log: Log) -> str:
+    """The command to verify as a standalone CLI from `repo`, or "" - and why not, logged.
+
+    Both must hold: the docs show real command lines for a command named like
+    the repo (`commands.MIN_COMMAND_LINES` in shell fences; prose does not
+    count), and the repo's GitHub releases carry a Linux binary for it. The
+    docs are read first so that a repo whose docs show no such commands costs no
+    GitHub request - 60 an hour without a token. A GitHub that cannot be asked
+    skips the CLI and never fails the scan."""
+    from .acquire import binaries
+    from .extract.commands import MIN_COMMAND_LINES, command_lines
+    if not _github_repo(repo):
+        return ""
+    shipped = _ships_bin(targets, bins, name)
+    if shipped:
+        log(f"  {name} is also a command of {shipped}, which ships that bin - its command lines "
+            "are checked against that package, not a standalone CLI")
+        return ""
+    lines = await asyncio.to_thread(command_lines, pages, name)
+    if lines < MIN_COMMAND_LINES:
+        return ""
+    found = await asyncio.to_thread(binaries.lookup, repo, name)
+    if not found.installable:
+        log(f"  ! the docs show {lines} `{name}` command lines, but {found.why or 'no installable binary was found'}"
+            f" - not verifying {name} as a standalone CLI"
+            + ("; name it as cli:" + name + " to retry" if found.failed else ""))
+        return ""
+    log(f"  the docs show {lines} `{name}` command lines and {repo_name_of(repo)}'s releases carry "
+        f"a Linux binary for it - verifying {name} as a standalone CLI")
+    return name
+
+
+def repo_name_of(repo: str) -> str:
+    from .acquire.binaries import github_slug
+    slug = github_slug(repo)
+    return f"{slug[0]}/{slug[1]}" if slug else repo
+
+
 def pick_ecosystem(name: str, prefix: str, default: str,
                    on: Callable[[str, str], bool], linked: bool = False) -> str:
     """The registry a package that no repo describes is on.
@@ -342,7 +440,7 @@ def pick_ecosystem(name: str, prefix: str, default: str,
 
 async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
                    phase: Callable[[int], None] = lambda i: None) -> ScanOutcome:
-    from .acquire import acquire_repo, acquire_site, pick_versions, releases
+    from .acquire import acquire_repo, acquire_site, binaries, pick_versions, releases
     from .acquire.http import Fetcher
     from .acquire.repo import (
         CloneError,
@@ -350,6 +448,7 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         dotnet_surface,
         ensure_sources,
         find_packages,
+        npm_bins,
         repo_name,
         symbols_at_head,
     )
@@ -357,8 +456,10 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
     from .graph import GraphStore
     from .report import build_report
     from .verify import run_matrix, run_npm_matrix
+    from .verify.cli import run_cli_matrix
     from .verify.dotnet import Surface, run_dotnet_matrix
 
+    binaries.use_token(cfg.github_token)
     opts = inp.options
     if opts.extraction_models:
         # a per-scan choice wins over EXTRACTION_MODELS
@@ -386,10 +487,15 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
     targets: list[Target] = []
     head: dict[str, set[str]] = {}
     api: dict[str, Surface] = {}               # .NET packages' public API at HEAD
+    bins: dict[str, tuple[str, ...]] = {}      # what each npm target's package.json declares
     prefetched: dict[tuple[str, str], list[Release]] = {}
+    site_pages = list(pages)
     site_text = "\n".join(p.text for p in pages)
     multi = len(inp.repos) > 1
     entries = [split_package(p) for p in inp.packages]       # (ecosystem or "", name)
+    # a `cli:` entry names a command, not a package: it never takes a package's slot
+    cli_for, refused = _cli_homes(inp.repos, entries)
+    entries = [("", "") if eco == "cli" else (eco, name) for eco, name in entries]
 
     def known(name: str, eco: str) -> bool:
         if (eco, name) not in prefetched:
@@ -431,6 +537,7 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         # What the docs say decides which packages matter. A repo-only scan has
         # no site, so the repo's own docs stand in.
         corpus = site_text or "\n".join(p.text for p in repo_pages)
+        docs_pages = site_pages or repo_pages
         found = await asyncio.to_thread(find_packages, path, name)
         scores: dict[str, int] = {}
         if len(found) > 1:
@@ -446,16 +553,18 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         # in the order they were named: the first is the primary, as for
         # `--package Duende.IdentityServer Duende.BFF`
         named = list(dict.fromkeys(p for _, p in sorted(here, key=lambda x: x[0])))
-        plans.append((repo, path, commit, branch, corpus, found, scores, named))
+        plans.append((repo, path, commit, branch, corpus, found, scores, named, docs_pages))
 
     # ---- turn each repo into targets
-    for i, (repo, path, commit, branch, corpus, found, scores, named) in enumerate(plans):
+    cli_targets: list[Target] = []
+    skipped_cli: list[str] = list(refused)
+    for i, (repo, path, commit, branch, corpus, found, scores, named, docs_pages) in enumerate(plans):
         name = repo_name(repo)
         where = f" · {name}" if multi else ""
         pos = entries[i] if i < len(entries) and entries[i][1] else None
         unmatched = pos if pos and i not in claimed else None
         chosen = named
-        if not chosen and not unmatched:
+        if not chosen and not unmatched and not cli_for.get(i):
             chosen = _automatic(path, name, corpus, found, scores, log)
         if any(p.ecosystem == "npm" for p in chosen):
             # a cached sparse clone holds only docs until the JS/TS sources are fetched
@@ -463,6 +572,8 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         for pkg in chosen:
             imp = _import_name(pkg.name, pkg.ecosystem, pkg.import_name)
             syms = symbols_at_head(pkg.root, imp, pkg.ecosystem)
+            if pkg.ecosystem == "npm" and (declared := npm_bins(pkg.root)) is not None:
+                bins[pkg.name] = declared
             add(Target(package=pkg.name, import_name=imp, ecosystem=pkg.ecosystem,
                        repo_url=repo, branch=branch, commit=commit,
                        install_spec=(_source_spec(repo, commit, path, pkg.root)
@@ -480,10 +591,22 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
                        branch=branch, commit=commit,
                        install_spec=_source_spec(repo, commit, path, path) if eco == "pypi" else ""),
                 symbols_at_head(path, imp, eco), None, where)
-        elif not chosen:
+        elif not chosen and not cli_for.get(i):
             log(f"  ! {nothing_found(path, name)}. Its docs are read, nothing is verified "
                 "from it; name its package (the package field, or --package) to check the "
                 "docs against it")
+        # ---- a standalone CLI of this repo: named, or proposed from the docs and the releases
+        wanted = list(cli_for.get(i, []))
+        if not wanted and not named and not unmatched:
+            auto = await _auto_cli(repo, name, docs_pages, targets, bins, log)
+            wanted = [auto] if auto else []
+        for cmd in wanted:
+            found_cli = await asyncio.to_thread(binaries.lookup, repo, cmd)
+            t = _cli_target(found_cli, cmd, repo, branch, commit)
+            if t is None:
+                skipped_cli.append(f"cli:{cmd} not verified: {found_cli.why or 'no installable binary found'}")
+            else:
+                cli_targets.append(t)
     # an entry no repo answered is a package straight from its registry
     for j, (eco, want) in enumerate(entries):
         if want and j not in claimed and j >= len(inp.repos):
@@ -491,9 +614,24 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
             add(Target(package=want, import_name=_import_name(want, eco), ecosystem=eco),
                 set(), None)
 
+    # standalone CLIs come last: the primary target of a scan, which names its
+    # report and its graph, is a package whenever there is one
+    for t in cli_targets:
+        clash = next((x for x in targets if _norm(x.package) == _norm(t.package)), None)
+        if clash:
+            skipped_cli.append(f"cli:{t.package} not verified: {clash.package} ({clash.ecosystem}) already "
+                               "goes by that name, and a scan keys its results by package name")
+            continue
+        head[t.package] = set()
+        targets.append(t)
+        log(f"  {t.package} (cli) · command {t.package} · release binaries of "
+            f"{repo_name_of(t.repo_url)} ({t.commit})")
+    for msg in skipped_cli:
+        log(f"  ! {msg}")
     if not targets:
         looked = "; ".join(nothing_found(path, repo_name(repo)) for repo, path, *_ in plans)
-        raise ScanError("no package to verify - " + (looked + ". " if looked else "") +
+        why = "; ".join(skipped_cli + ([looked] if looked else []))
+        raise ScanError("no package to verify - " + (why + ". " if why else "") +
                         "Name one (the package field beside a repo, or --package on the "
                         "command line) or use a repo that has package metadata")
     if not pages:
@@ -503,8 +641,13 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
     phase(1)
     mentioned = sorted({p for pg in pages for p in pg.pinned_versions})
     for t in targets:
-        t.releases = await asyncio.to_thread(releases, t.package, t.ecosystem)
-        if not t.releases:
+        if t.ecosystem == "cli":
+            t.releases = (await asyncio.to_thread(binaries.lookup, t.repo_url, t.package)).rows()
+        else:
+            t.releases = await asyncio.to_thread(releases, t.package, t.ecosystem)
+        if not t.releases and t.ecosystem == "cli":
+            log(f"  ! {t.package} has no releases on GitHub - nothing can be verified")
+        elif not t.releases:
             if t.install_spec:
                 log(f"  ! {t.package} has no releases on {t.ecosystem} - installing the repo "
                     f"itself at {t.commit}")
@@ -514,7 +657,10 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         t.versions = pick_versions(t.releases, opts.versions, mentioned,
                                    spread=t.ecosystem in SPREAD_ECOSYSTEMS) or [Release(label="HEAD")]
         who = f" · {t.package}" if len(targets) > 1 else ""
-        log(f"  {len(t.releases)} releases · testing {', '.join(t.labels)}{who}")
+        if t.ecosystem == "cli":
+            log(f"  {t.package} (cli) · {len(t.releases)} releases · testing {', '.join(t.labels)}")
+        else:
+            log(f"  {len(t.releases)} releases · testing {', '.join(t.labels)}{who}")
     if mentioned:
         log(f"  ! docs mention versions: {', '.join(mentioned[:6])}")
 
@@ -523,7 +669,7 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
     all_head = set().union(*head.values()) if head else set()
     ex = await asyncio.to_thread(
         extract, pages, targets, cfg, log,
-        assume_credentialed=opts.assume_credentialed, head_symbols=all_head)
+        assume_credentialed=opts.assume_credentialed, head_symbols=all_head, bins=bins)
 
     # ------------------------------------------------------- verification
     phase(3)
@@ -541,6 +687,10 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
             if len(targets) > 1:
                 log(f"  {t.package}: {_to_check(snips)}")
             got = await run_npm_matrix(snips, t.package, t.labels, cfg, log)
+        elif t.ecosystem == "cli":
+            if len(targets) > 1:
+                log(f"  {t.package}: {_to_check(snips)}")
+            got = await run_cli_matrix(snips, t.package, t.labels, cfg, log, repo_url=t.repo_url)
         elif t.ecosystem != "pypi":
             log(f"  ! {t.package}: no verification lane for {t.ecosystem} packages yet - "
                 "marked unverified")

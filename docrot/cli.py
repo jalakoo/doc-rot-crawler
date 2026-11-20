@@ -98,12 +98,16 @@ def scan(args) -> int:
 
 def packages_cmd(args) -> int:
     """What a scan would find in each repo: every PyPI, npm and NuGet package,
+    and a standalone CLI when the repo's GitHub releases carry its binary,
     with the `eco:name` to pass to `--package`. The terminal's "detect" step.
     Exits 1 when a repo holds none, 3 when one cannot be fetched."""
+    from .acquire import binaries
+    from .acquire.detect import cli_row
     from .acquire.repo import CloneError, clone, find_packages, repo_name
     from .scan import nothing_found
 
     cfg = cfgmod.load()
+    binaries.use_token(cfg.github_token)
     code = 0
     for repo in args.repo:
         try:
@@ -113,7 +117,10 @@ def packages_cmd(args) -> int:
             code = 3
             continue
         found = find_packages(path, repo_name(repo))
-        if not found:
+        standalone, why = cli_row(repo, found)
+        if why:
+            console.print(f"[yellow]{why}[/yellow]", highlight=False)
+        if not found and not standalone:
             console.print(f"[yellow]{nothing_found(path, repo_name(repo))}[/yellow]", highlight=False)
             code = code or 1
             continue
@@ -128,8 +135,11 @@ def packages_cmd(args) -> int:
                 where = str(p.root)
             t.add_row(f"{p.ecosystem}:{p.name}", p.import_name,
                       "." if where in ("", ".") else where)
+        if standalone:
+            t.add_row(standalone["spec"], standalone["import_name"],
+                      f"GitHub release binaries (latest {standalone['latest']})")
         console.print(t)
-        if len(found) > 1:
+        if len(found) + bool(standalone) > 1:
             log("  a scan verifies the ones its docs mention (up to "
                 f"{MAX_AUTO_PACKAGES}); name packages with --package eco:name to choose")
     return code
@@ -289,11 +299,15 @@ def parser() -> argparse.ArgumentParser:
                         "docs site is checked against every repo's package")
     s.add_argument("--package", action="extend", nargs="+", metavar="[ECO:]NAME",
                    help="package to verify, optionally with its registry: pypi:relate-db, "
-                        "npm:@relate/relate, nuget:Relate.Net. Name one or more of a repo's "
+                        "npm:@relate/relate, nuget:Relate.Net - or cli:relate for a standalone "
+                        "command-line tool installed from the repo's GitHub release binaries "
+                        "(needs a GitHub --repo). Name one or more of a repo's "
                         "packages and only those are verified from it (the first name goes "
                         "with the first --repo, and so on; any name is matched against every "
                         "repo). Name none and docrot verifies every package in the repo that "
-                        f"the docs mention, at most {MAX_AUTO_PACKAGES} per repo - see "
+                        f"the docs mention, at most {MAX_AUTO_PACKAGES} per repo, plus a standalone CLI "
+                        "named like the repo when the docs show its command lines and the releases "
+                        "carry its binary - see "
                         "`docrot packages REPO` for what a repo holds. A name no repo has is "
                         "verified from its registry")
     s.add_argument("--name", help="dashboard name for this scan")
@@ -322,7 +336,8 @@ def parser() -> argparse.ArgumentParser:
 
     pk = sub.add_parser(
         "packages", help="the packages a repo holds, before you scan it",
-        description="List the PyPI, npm and NuGet packages a repo publishes, each with the eco:name "
+        description="List the PyPI, npm and NuGet packages a repo publishes, and its standalone "
+                    "CLI when GitHub releases carry the binary, each with the eco:name "
                     "to give `docrot scan --package`. Exits 1 when a repo holds none, 3 when it "
                     "cannot be fetched.")
     pk.add_argument("repo", nargs="+", metavar="REPO", help="git URL or local path")
