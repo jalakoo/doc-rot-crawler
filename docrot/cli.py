@@ -1,6 +1,7 @@
 """docrot command line.
 
     docrot scan --docs-url URL [URL ...] --repo URL [URL ...] [--name NAME]
+    docrot packages REPO [REPO ...] # which packages a repo holds, before scanning it
     docrot scans
     docrot serve [--port 8080]
     docrot blast SYMBOL [--scan ID]
@@ -21,6 +22,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config as cfgmod
+from .scan import MAX_AUTO_PACKAGES
 from .store import ScanOptions, ScanRecord, Store, align_packages
 
 console = Console()
@@ -92,6 +94,45 @@ def scan(args) -> int:
         from .server import serve
         serve(store, args.port, path=f"scan/{rec.id}")
     return 1 if report.get("stats", {}).get("findings") else 0
+
+
+def packages_cmd(args) -> int:
+    """What a scan would find in each repo: every PyPI, npm and NuGet package,
+    with the `eco:name` to pass to `--package`. The terminal's "detect" step.
+    Exits 1 when a repo holds none, 3 when one cannot be fetched."""
+    from .acquire.repo import CloneError, clone, find_packages, repo_name
+    from .scan import nothing_found
+
+    cfg = cfgmod.load()
+    code = 0
+    for repo in args.repo:
+        try:
+            path, commit, _ = clone(repo, log, cfg.clone_timeout)
+        except CloneError as e:
+            console.print(f"[red]couldn't fetch {repo}: {e}[/red]", highlight=False)
+            code = 3
+            continue
+        found = find_packages(path, repo_name(repo))
+        if not found:
+            console.print(f"[yellow]{nothing_found(path, repo_name(repo))}[/yellow]", highlight=False)
+            code = code or 1
+            continue
+        t = Table(title=f"\n{repo_name(repo)} ({commit})", title_justify="left",
+                  header_style="bold")
+        for col in ("package", "import", "path"):
+            t.add_column(col, overflow="fold")
+        for p in found:
+            try:
+                where = p.root.resolve().relative_to(path.resolve()).as_posix()
+            except ValueError:
+                where = str(p.root)
+            t.add_row(f"{p.ecosystem}:{p.name}", p.import_name,
+                      "." if where in ("", ".") else where)
+        console.print(t)
+        if len(found) > 1:
+            log("  a scan verifies the ones its docs mention (up to "
+                f"{MAX_AUTO_PACKAGES}); name packages with --package eco:name to choose")
+    return code
 
 
 def _print_summary(report: dict):
@@ -246,13 +287,21 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--repo", action="extend", nargs="+", metavar="REPO",
                    help="git URL or local path; repeat or list several. Every "
                         "docs site is checked against every repo's package")
-    s.add_argument("--package", action="extend", nargs="+", metavar="NAME",
-                   help="package name, by position with --repo (inferred from each "
-                        "repo when omitted); names past the last repo need no repo")
+    s.add_argument("--package", action="extend", nargs="+", metavar="[ECO:]NAME",
+                   help="package to verify, optionally with its registry: pypi:relate-db, "
+                        "npm:@relate/relate, nuget:Relate.Net. Name one or more of a repo's "
+                        "packages and only those are verified from it (the first name goes "
+                        "with the first --repo, and so on; any name is matched against every "
+                        "repo). Name none and docrot verifies every package in the repo that "
+                        f"the docs mention, at most {MAX_AUTO_PACKAGES} per repo - see "
+                        "`docrot packages REPO` for what a repo holds. A name no repo has is "
+                        "verified from its registry")
     s.add_argument("--name", help="dashboard name for this scan")
-    s.add_argument("--ecosystem", default="pypi", choices=["pypi", "npm", "nuget"],
-                   help="registry for a --package with no repo or whose repo has no package "
-                        "metadata (a repo that has it says for itself)")
+    s.add_argument("--ecosystem", default="auto", choices=["auto", "pypi", "npm", "nuget"],
+                   help="registry for a --package that no repo describes and that has no "
+                        "eco: prefix; a repo's own package metadata always says for itself. "
+                        "auto (the default) asks PyPI, npm and NuGet and uses the one that has "
+                        "the name, and stops if several do")
     s.add_argument("--versions", type=int, default=3)
     s.add_argument("--max-pages", type=int, help="per docs site")
     s.add_argument("--no-cache", action="store_true")
@@ -270,6 +319,13 @@ def parser() -> argparse.ArgumentParser:
              "openai/gpt-sol-latest")
     s.add_argument("--serve", action="store_true", help="open the dashboard when done")
     s.add_argument("--port", type=int, default=8080)
+
+    pk = sub.add_parser(
+        "packages", help="the packages a repo holds, before you scan it",
+        description="List the PyPI, npm and NuGet packages a repo publishes, each with the eco:name "
+                    "to give `docrot scan --package`. Exits 1 when a repo holds none, 3 when it "
+                    "cannot be fetched.")
+    pk.add_argument("repo", nargs="+", metavar="REPO", help="git URL or local path")
 
     sub.add_parser("scans", help="list recorded scans")
 
@@ -305,6 +361,8 @@ def main(argv=None) -> int:
         if not args.docs_url and not args.repo:
             p.error("pass --docs-url, --repo, or both")
         return scan(args)
+    if args.cmd == "packages":
+        return packages_cmd(args)
     if args.cmd == "scans":
         return list_scans(args)
     if args.cmd == "diff":

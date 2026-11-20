@@ -92,21 +92,69 @@
      packages[i] names the package for repos[i] (blank keeps the slot), then
      packages with no repo follow. A package typed on a blank or duplicate repo
      row can't keep its slot, so it moves to the repo-less tail. Trailing blanks
-     are dropped; repeated names are kept once. */
-  function alignPackages(reposRaw, pkgsRaw, extraRaw) {
+     are dropped; repeated names are kept once.
+
+     `picks[i]` is what "Detect packages" left ticked for repos[i]: null when
+     detection did not run or every box stayed ticked (the scan then chooses
+     for itself), else the prefixed specs ("npm:@relate/relate") to verify. A
+     typed package keeps the repo's own slot and the picks follow it in the
+     tail; with none typed, the first pick takes the slot. Naming anything makes
+     the scan verify exactly the named packages of that repo, which is why a
+     typed name and a pick are both kept. A pick equal to a typed name, with or
+     without its prefix, counts once. */
+  var PREFIX = /^(pypi|npm|nuget):/i;
+  /* the same package, typed with or without its ecosystem prefix; two prefixed
+     names are the same only if the ecosystems agree too */
+  function samePackage(a, b) {
+    if (PREFIX.test(a) && PREFIX.test(b)) return a.toLowerCase() === b.toLowerCase();
+    return a.replace(PREFIX, "").toLowerCase() === b.replace(PREFIX, "").toLowerCase();
+  }
+  function alignPackages(reposRaw, pkgsRaw, extraRaw, picks) {
     var seen = [], aligned = [], tail = [];
     function clean(v) { return String(v || "").trim(); }
     reposRaw.forEach(function (raw, i) {
       var repo = clean(raw), pkg = clean(pkgsRaw[i]);
-      if (repo && seen.indexOf(repo) < 0) { seen.push(repo); aligned.push(pkg); }
-      else if (pkg) tail.push(pkg);
+      var chosen = ((picks || [])[i] || []).map(clean).filter(Boolean);
+      if (repo && seen.indexOf(repo) < 0) {
+        seen.push(repo);
+        if (!pkg && chosen.length) pkg = chosen.shift();
+        aligned.push(pkg);
+        tail = tail.concat(chosen);
+      } else if (pkg) tail.push(pkg);
     });
     (extraRaw || []).forEach(function (raw) { if (clean(raw)) tail.push(clean(raw)); });
-    var named = aligned.filter(Boolean);
-    tail = tail.filter(function (p, i) { return tail.indexOf(p) === i && named.indexOf(p) < 0; });
-    var out = aligned.concat(tail);
+    var named = aligned.filter(Boolean), kept = [];
+    tail.forEach(function (p) {
+      if (kept.concat(named).some(function (k) { return samePackage(k, p); })) return;
+      kept.push(p);
+    });
+    var out = aligned.concat(kept);
     while (out.length && !out[out.length - 1]) out.pop();
     return out;
+  }
+
+  /* What a repo's detection left ticked, for alignPackages: null when every
+     box is ticked (send nothing, the scan chooses), else the ticked specs. */
+  function detectedPicks(specs, ticked) {
+    var on = specs.filter(function (s) { return ticked.indexOf(s) >= 0; });
+    return on.length === specs.length ? null : on;
+  }
+
+  var ECO_LABEL = { pypi: "PyPI", npm: "npm", nuget: "NuGet" };
+  var OTHER_LABEL = { rust: "Rust", go: "Go", java: "Java", swift: "Swift", ruby: "Ruby", php: "PHP" };
+
+  /* "relate-db   PyPI · import relate · surfaces/relate-python" as {name, meta}. */
+  function detectedLine(pkg) {
+    var meta = [ECO_LABEL[pkg.ecosystem] || pkg.ecosystem];
+    if (pkg.import_name && pkg.import_name !== pkg.name) meta.push("import " + pkg.import_name);
+    if (pkg.path) meta.push(pkg.path);
+    return { name: pkg.name, meta: meta.join(" · ") };
+  }
+
+  function otherNote(other) {
+    if (!other || !other.length) return "";
+    return "Also contains " + andList(other.map(function (o) { return OTHER_LABEL[o] || o; })) +
+           " — no checker for " + (other.length === 1 ? "it" : "them") + " yet.";
   }
 
   function defaultName(docs, repos) {
@@ -193,6 +241,38 @@
       .replace(/&lt;(\/?)(b|code)&gt;/g, "<$1$2>");
   }
 
+  /* What a run did not check. {total, checked, unchecked, reasons: [{code, label,
+     n, detail}]} from a report's `coverage` block, or null when the report has
+     none (reports from before it was recorded) or nothing was extracted. */
+  function coverageView(cov) {
+    if (!cov || !cov.tiers) return null;
+    var t = cov.tiers, checked = (t.execute || 0) + (t.structural || 0);
+    var unchecked = t.unverifiable || 0, total = checked + unchecked;
+    if (!total) return null;
+    var langs = Object.keys(cov.no_checker || {}).sort(function (a, b) {
+      return (cov.no_checker[b] - cov.no_checker[a]) || a.localeCompare(b);
+    });
+    var reasons = Object.keys(cov.unverifiable || {}).sort(function (a, b) {
+      return (cov.unverifiable[b] - cov.unverifiable[a]) || a.localeCompare(b);
+    }).map(function (code) {
+      var detail = code === "no-checker" ? langs.slice(0, 4).map(function (l) {
+        return l + " " + cov.no_checker[l];
+      }).join(", ") + (langs.length > 4 ? ", …" : "") : "";
+      return { code: code, label: (cov.labels || {})[code] || code, n: cov.unverifiable[code], detail: detail };
+    });
+    return { total: total, checked: checked, unchecked: unchecked, reasons: reasons };
+  }
+
+  /* "186 snippets · 14 checked · 172 not checked: 120 use no scanned package · 35 not code" */
+  function coverageSentence(view) {
+    var s = plural(view.total, "snippet") + " · " + view.checked + " checked · " +
+            view.unchecked + " not checked";
+    if (!view.unchecked) return s;
+    return s + ": " + view.reasons.map(function (r) {
+      return r.n + " " + r.label + (r.detail ? " (" + r.detail + ")" : "");
+    }).join(" · ");
+  }
+
   /* A report from before multi-source support gets the fields app.js expects. */
   function normalizeReport(rep) {
     if (!rep.docs_urls) rep.docs_urls = rep.docs_url ? [rep.docs_url] : [];
@@ -209,6 +289,8 @@
       rep.sources = rep.docs_urls.map(function (u) { return { kind: "docs", url: u, pages: total - repoPages }; })
         .concat(rep.repo_urls.map(function (u) { return { kind: "repo", url: u, pages: repoPages }; }));
     }
+    // `coverage` is optional: older reports never had it, and is left absent
+    if (rep.coverage && typeof rep.coverage !== "object") delete rep.coverage;
     return rep;
   }
 
@@ -236,7 +318,8 @@
     PHASES: PHASES, STATE_LBL: STATE_LBL, esc: esc, isHttp: isHttp, hostOf: hostOf,
     shortSrc: shortSrc, repoName: repoName, fmtAbs: fmtAbs, fmtAgo: fmtAgo, plural: plural,
     andList: andList, isDocsUrl: isDocsUrl, isRepo: isRepo, checkSources: checkSources,
-    alignPackages: alignPackages,
+    alignPackages: alignPackages, detectedPicks: detectedPicks, detectedLine: detectedLine,
+    otherNote: otherNote, coverageView: coverageView, coverageSentence: coverageSentence,
     defaultName: defaultName, lastRun: lastRun, cardState: cardState,
     findingsDelta: findingsDelta, activityAt: activityAt, sortScans: sortScans,
     fleetTotals: fleetTotals, pageBarCells: pageBarCells, normalizeReport: normalizeReport,

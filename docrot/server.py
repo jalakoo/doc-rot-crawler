@@ -5,6 +5,7 @@
     GET    /api/scans/{id}              one scan
     PATCH  /api/scans/{id}              rename
     POST   /api/scans/{id}/runs         queue another run
+    POST   /api/detect                  the packages each repo holds, before a scan names them
     POST   /api/imports                 adopt an exported run (JSON Lines or SARIF)
     GET    /api/scans/{id}/report       the newest report (?run=<id> for another)
     GET    /api/scans/{id}/findings.jsonl   the same run as JSON Lines, for agents
@@ -24,6 +25,8 @@ import re
 import threading
 import time
 import webbrowser
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -33,8 +36,17 @@ from pydantic import BaseModel, Field
 
 from . import config as cfgmod
 from . import settings
+from .acquire.detect import detect as detect_repo
 from .report.ingest import BadExport
-from .store import AlreadyImported, RunSummary, ScanOptions, ScanRecord, ScanStatus, Store
+from .store import (
+    AlreadyImported,
+    RunSummary,
+    ScanOptions,
+    ScanRecord,
+    ScanStatus,
+    Store,
+    is_repo,
+)
 from .worker import AlreadyActive, ScanWorker
 
 UI = Path(__file__).resolve().parent / "ui"
@@ -49,6 +61,9 @@ CSP = ("default-src 'self'; script-src 'self'; "
        "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
        "font-src https://fonts.gstatic.com; img-src 'self' data:; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+# Each repo is a git clone, so a request is bounded: ten repos, four at a time.
+MAX_DETECT = 10
+DETECT_THREADS = 4
 ASSETS = ("styles.css", "lib.js", "app.js")
 ASSET_REF = re.compile(r'((?:src|href)=")(' + "|".join(map(re.escape, ASSETS)) + r')(")')
 
@@ -99,6 +114,10 @@ class CreateScan(BaseModel):
     options: ScanOptions = Field(default_factory=ScanOptions)
 
 
+class DetectRepos(BaseModel):
+    repos: list[str] = Field(default_factory=list)
+
+
 class UpdateScan(BaseModel):
     name: str
 
@@ -116,7 +135,10 @@ def _hostname(value: str) -> str:
     return value.split(":")[0]
 
 
-def create_app(store: Store, worker: ScanWorker) -> FastAPI:
+def create_app(store: Store, worker: ScanWorker,
+               detect: Callable[[str], dict] = detect_repo) -> FastAPI:
+    """`detect` is injectable like the worker's runner: tests pass one that
+    answers without cloning."""
     app = FastAPI(title="docrot", docs_url="/api/docs", redoc_url=None)
 
     @app.middleware("http")
@@ -163,6 +185,25 @@ def create_app(store: Store, worker: ScanWorker) -> FastAPI:
             raise HTTPException(422, e.args[0]) from e
         worker.enqueue(rec.id)
         return view(rec)
+
+    @app.post("/api/detect")
+    def detect_packages(body: DetectRepos):
+        """What each repo holds. A plain `def`, so FastAPI runs it on a worker
+        thread: a first clone takes up to a minute and must not stall the loop
+        that serves the dashboard's polling. A repo that cannot be read is an
+        entry with an `error`, not a failed request - one bad URL among several
+        must not hide the others."""
+        repos = list(dict.fromkeys(r.strip() for r in body.repos if r and r.strip()))
+        if not repos:
+            raise HTTPException(422, ["Add at least one repository to look in."])
+        if len(repos) > MAX_DETECT:
+            raise HTTPException(422, [f"At most {MAX_DETECT} repositories at a time."])
+        bad = [f"Repository {i} isn't a git URL or a local path (/…, ./…, ~/…)."
+               for i, r in enumerate(repos, 1) if not is_repo(r)]
+        if bad:
+            raise HTTPException(422, bad)
+        with ThreadPoolExecutor(min(len(repos), DETECT_THREADS)) as pool:
+            return {"repos": list(pool.map(detect, repos))}
 
     @app.post("/api/imports", response_model=ScanView, status_code=201)
     async def import_export(request: Request, filename: str = "", name: str = ""):

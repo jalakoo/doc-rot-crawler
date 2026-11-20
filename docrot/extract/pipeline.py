@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 
 from ..config import Config
-from ..models import Claim, Extraction, PackageRef, Page, Snippet
+from ..models import REASONS, UNRECORDED, Claim, Extraction, PackageRef, Page, Snippet, coverage
 from . import claims as claims_mod
 from . import csharp, fences, javascript, llm, symbols, tiers
 
@@ -49,16 +49,37 @@ def extract(pages: list[Page], packages: Sequence[PackageRef], cfg: Config,
         + (f" ({len(found)} lexical + {len(claims) - len(found)} model)"
            if model_claims else ""))
 
-    counts: dict[str, int] = {}
-    for s in snips:
-        counts[s.tier] = counts.get(s.tier, 0) + 1
+    counts = {k: v for k, v in coverage(snips)["tiers"].items() if v}
     log("  tiers: " + " · ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    if gap := not_checked_line(snips):
+        log(gap)
 
     return Extraction(
         package=primary.package, import_name=primary.import_name,
         ecosystem=primary.ecosystem, packages=list(packages),
         pages=pages, snippets=snips, claims=claims,
     )
+
+
+SHOWN_LANGS = 5            # languages named in the log line before "+N more"
+
+
+def not_checked_line(snips: list[Snippet]) -> str:
+    """The log line that makes the gap visible, or '' when nothing is unverifiable.
+
+    e.g. `  not checked: 359 not code · 87 no checker (swift 22, rust 17) · 41 use no scanned package`
+    """
+    cov = coverage(snips)
+    parts = []
+    for reason, n in cov["unverifiable"].items():
+        part = f"{n} {REASONS.get(reason, UNRECORDED)}"
+        if reason == "no-checker":
+            langs = list(cov["no_checker"].items())
+            named = ", ".join(f"{lang or '?'} {c}" for lang, c in langs[:SHOWN_LANGS])
+            more = f", +{len(langs) - SHOWN_LANGS} more" if len(langs) > SHOWN_LANGS else ""
+            part += f" ({named}{more})"
+        parts.append(part)
+    return "  not checked: " + " · ".join(parts) if parts else ""
 
 
 MIN_OVERLAP = 0.6          # share of a claim's words the page must also use
@@ -126,7 +147,7 @@ def prune_declares(snippets: list[Snippet], head_symbols: set[str]) -> None:
         s.declares = [d for d in s.declares if d.get("name") in tails]
         if s.kind == "declaration" and not s.declares and not s.symbols \
                 and s.tier == "structural":
-            s.tier = "unverifiable"
+            s.tier = tiers.skip(s, "not-declared")
 
 
 def attribute(snippets: list[Snippet], packages: Sequence[PackageRef]) -> None:
@@ -210,15 +231,6 @@ def _root(sym: str, by_import: dict[str, str], npm: set[str] | None = None) -> s
 LANGUAGE = {"pypi": "python", "npm": "javascript", "nuget": "csharp"}
 
 
-def _family(lang: str) -> str:
-    """python / csharp / javascript, or '' for what is neutral (shell, prose)."""
-    if csharp.is_csharp(lang):
-        return "csharp"
-    if lang in ("python", "py", "python3"):
-        return "python"
-    return "javascript" if javascript.is_js(lang) else ""
-
-
 def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef]) -> None:
     """A snippet can only be checked against a package in its own language.
 
@@ -237,17 +249,17 @@ def match_languages(snippets: list[Snippet], packages: Sequence[PackageRef]) -> 
             continue
         ecosystem = eco.get(s.package, "pypi")
         want = LANGUAGE.get(ecosystem, "")
-        lang = _family(s.lang)
-        if lang:
+        lang = fences.family(s.lang)
+        if lang in LANGUAGE.values():
             if lang != want:
-                s.tier = "unverifiable"
+                s.tier = tiers.skip(s, "other-language")
         elif want == "csharp":
-            s.tier = "unverifiable"
+            s.tier = tiers.skip(s, "no-package-use")
         elif want == "javascript":
             if not _names_npm(s, s.package, npm):
-                s.tier = "unverifiable"
+                s.tier = tiers.skip(s, "no-package-use")
         elif _names_npm_only(s):
-            s.tier = "unverifiable"
+            s.tier = tiers.skip(s, "other-language")
 
 
 def _names_npm(s: Snippet, package: str, npm: dict[str, str]) -> bool:

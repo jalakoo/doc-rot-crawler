@@ -8,9 +8,32 @@ import re
 import mistune
 
 from ..models import Page, Snippet
+from . import csharp, javascript
 
-PY_LANGS = {"python", "py", "python3"}
-SHELL_LANGS = {"bash", "sh", "shell", "console", "zsh"}
+PY_LANGS = frozenset({"python", "py", "python3"})
+# Fences that hold prose, config, data, diagrams or queries rather than a
+# program, so a missing checker is not the reason they go unchecked.
+NOT_CODE_LANGS = frozenset({
+    "", "text", "txt", "plaintext", "plain", "output", "log", "none", "table",
+    "markdown", "md", "mdx", "diff", "patch", "mermaid", "plantuml", "dot",
+    "json", "jsonc", "json5", "jsonl", "yaml", "yml", "toml", "ini", "env",
+    "csv", "tsv", "html", "xml", "svg", "cypher", "sparql", "sql", "graphql", "gql"})
+
+
+def family(lang: str) -> str:
+    """python / javascript / csharp / shell have a lane; other-code is a
+    programming language with none; not-code is everything that is not a
+    program. The one place a fence language is classified."""
+    lang = lang.strip().lower()
+    if lang in PY_LANGS:
+        return "python"
+    if javascript.is_js(lang):
+        return "javascript"
+    if csharp.is_csharp(lang):
+        return "csharp"
+    if lang in javascript.SHELL_LANGS:
+        return "shell"
+    return "not-code" if lang in NOT_CODE_LANGS else "other-code"
 
 
 def parse(pages: list[Page]) -> list[Snippet]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 from ..models import Snippet, Tier
-from . import csharp, javascript
+from . import csharp, fences, javascript
 from .completeness import classify
 
 PLACEHOLDER = re.compile(
@@ -19,8 +19,6 @@ PLACEHOLDER = re.compile(
 NETWORK = re.compile(
     r"\b(requests\.|httpx\.|urllib|aiohttp|\.post\(|\.get\(|curl |wget )", re.I)
 CREDS = re.compile(r"\b([A-Z][A-Z0-9_]*_(?:API_)?(?:KEY|TOKEN|SECRET|PASSWORD))\b")
-PROSE_LANGS = {"text", "mermaid", "diff", "json", "yaml", "yml", "toml",
-               "html", "xml", "cypher", "sparql", "sql", ""}
 
 
 def assign(snippets: list[Snippet], available_creds: set[str],
@@ -32,18 +30,26 @@ def assign(snippets: list[Snippet], available_creds: set[str],
     names = [import_name] if isinstance(import_name, str) else list(import_name)
     npm = [n for n in (npm_packages or []) if n]
     for s in snippets:
+        s.reason = ""
         s.tier = _tier(s, available_creds, names, assume_credentialed, npm)
+
+
+def skip(s: Snippet, reason: str) -> Tier:
+    """Mark `s` unverifiable and record why; the one way a tier is given up."""
+    s.reason = reason
+    return "unverifiable"
 
 
 def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
           assume_credentialed: bool = False, npm_names: list[str] | None = None) -> Tier:
     import_names = [n for n in (import_names or []) if n]
     npm = [n for n in (npm_names or []) if n]
-    if s.lang in PROSE_LANGS:
-        return "unverifiable"
+    if fences.family(s.lang) == "not-code":
+        return skip(s, "not-code")
 
     if s.lang in ("bash", "sh", "shell", "console") or (npm and s.lang == "zsh"):
-        return _shell_tier(s.code, npm)
+        tier = _shell_tier(s.code, npm)
+        return skip(s, "no-package-use") if tier == "unverifiable" else tier
 
     if npm and javascript.is_js(s.lang):
         return _js_tier(s, creds, npm, assume_credentialed)
@@ -52,10 +58,13 @@ def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
         # Compiled, never run: the .NET lane checks every C# snippet against
         # each release with the compiler.
         s.kind, s.declares = csharp.classify(s.code)
-        return "unverifiable" if s.kind == "fragment" else "structural"
+        return skip(s, "fragment") if s.kind == "fragment" else "structural"
 
-    if s.lang not in ("python", "py", "python3"):
-        return "unverifiable"
+    if s.lang not in fences.PY_LANGS:
+        # a JS/TS fence in a scan with no npm package has a lane, just not here;
+        # zsh outside an npm scan is shell that runs nothing of ours
+        reason = {"javascript": "other-language", "shell": "no-package-use"}
+        return skip(s, reason.get(fences.family(s.lang), "no-checker"))
 
     kind, decls = classify(s.code)
     s.kind = kind
@@ -68,7 +77,7 @@ def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
     # A fragment references names it never binds. Running it produces a
     # NameError about the excerpt, not about the documentation.
     if kind == "fragment":
-        return "structural" if s.symbols else "unverifiable"
+        return "structural" if s.symbols else skip(s, "fragment")
 
     needed = set(CREDS.findall(s.code))
     if PLACEHOLDER.search(s.code) or needed or NETWORK.search(s.code):
@@ -135,7 +144,7 @@ def _js_tier(s: Snippet, creds: set[str], npm: list[str], assume_credentialed: b
     we lack; where unsure the answer is `structural`."""
     uses = [u for u in javascript.uses(s.code) if javascript.package_of(u.specifier) in npm]
     if not uses:
-        return "unverifiable"
+        return skip(s, "no-package-use")
     code = javascript.mask(s.code)       # a `<div>` or `fetch(` inside a string is not markup or a call
     if s.lang.lower() in JSX_LANGS or JSX.search(code) or BROWSER.search(code):
         return "structural"
@@ -158,7 +167,9 @@ def _js_tier(s: Snippet, creds: set[str], npm: list[str], assume_credentialed: b
 # documentation - reporting those as rot is a false positive.
 INSTALL_LINE = re.compile(
     r"^\s*(?:\$\s*)?(?:pip3?|uv pip|python -m pip)\s+install\s+(?P<args>.+?)\s*$")
-LOCAL_TARGET = re.compile(r"(^-r\b|^--requirement\b|^-e\b|^\.$|^\.\.?/|/|\.txt$)")
+# `relate_db-<version>-<platform>.whl`: a file the reader has built or downloaded, or a
+# placeholder the reader fills in - neither is something the sandbox can fetch.
+LOCAL_TARGET = re.compile(r"(^-r\b|^--requirement\b|^-e\b|^\.$|^\.\.?/|/|\.txt$|\.(?:whl|zip|tar\.gz)$|<[^<>\s]+>)")
 
 
 def _pure_install(code: str) -> bool:

@@ -11,6 +11,14 @@ from docrot.worker import ScanWorker
 from tests.fakes import fake_runner
 
 
+@pytest.fixture(autouse=True)
+def cache(tmp_path, monkeypatch):
+    """Cloning never touches the real data/cache."""
+    import docrot.acquire.repo as repo
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    return tmp_path / "cache"
+
+
 @pytest.fixture
 def client(store, cfg):
     worker = ScanWorker(store, lambda s, i: execute_scan(s, i, runner=fake_runner(), cfg=cfg))
@@ -209,3 +217,123 @@ def test_a_scan_stuck_running_from_a_dead_process_can_be_run_again(client, store
     assert client.post(f"/api/scans/{scan['id']}/runs").status_code == 202
     client.worker.join()
     assert store.status(scan["id"]).state == "done"
+
+
+# ------------------------------------------------------------------- detect
+
+def _git(*args, cwd):
+    import subprocess
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(cwd), "PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
+
+
+@pytest.fixture
+def monorepo(tmp_path):
+    """A polyglot repo in a real git repository: PyPI and npm packages, and
+    Rust and Go manifests docrot cannot check."""
+    root = tmp_path / "mono"
+    (root / "py" / "monopy").mkdir(parents=True)
+    (root / "py" / "pyproject.toml").write_text('[project]\nname = "mono-py"\n')
+    (root / "py" / "monopy" / "__init__.py").write_text("def go(): ...\n")
+    (root / "js").mkdir()
+    (root / "js" / "package.json").write_text('{"name": "@mono/js", "version": "1.0.0"}')
+    (root / "Cargo.toml").write_text('[package]\nname = "mono"\n')
+    (root / "tools").mkdir()
+    (root / "tools" / "go.mod").write_text("module example.com/tools\n")
+    (root / "README.md").write_text("# Mono\n")
+    _git("init", "-q", "-b", "main", cwd=root)
+    _git("add", ".", cwd=root)
+    _git("commit", "-qm", "one", cwd=root)
+    return root
+
+
+def _by_name(found):
+    return {p["name"]: p for p in found["packages"]}
+
+
+def test_detect_lists_the_packages_of_a_local_repo(client, monorepo):
+    r = client.post("/api/detect", json={"repos": [str(monorepo)]})
+    assert r.status_code == 200
+    (found,) = r.json()["repos"]
+    assert found["repo"] == str(monorepo) and "error" not in found
+    pkgs = _by_name(found)
+    assert pkgs["mono-py"] == {"name": "mono-py", "import_name": "monopy", "ecosystem": "pypi",
+                               "path": "py", "spec": "pypi:mono-py"}
+    assert pkgs["@mono/js"]["spec"] == "npm:@mono/js" and pkgs["@mono/js"]["path"] == "js"
+    assert found["other"] == ["go", "rust"]
+    assert found["commit"] and found["branch"] == "main"
+
+
+def test_detect_clones_a_repo_url_and_reads_other_ecosystems_from_git(client, monorepo, cache):
+    from docrot.acquire.detect import detect
+    found = detect(f"file://{monorepo}")           # the clone is sparse: no Cargo.toml on disk
+    assert sorted(_by_name(found)) == ["@mono/js", "mono-py"]
+    assert found["other"] == ["go", "rust"]
+    assert not list(cache.glob("*/Cargo.toml"))
+    assert detect(f"file://{monorepo}")["commit"] == found["commit"]      # cached clone, refreshed
+
+
+def test_detect_reports_a_bad_repo_inline_not_as_a_500(client, tmp_path):
+    missing = str(tmp_path / "nowhere")
+    r = client.post("/api/detect", json={"repos": [missing, "https://nowhere.invalid/no/repo"]})
+    assert r.status_code == 200
+    bad = r.json()["repos"]
+    assert [b["repo"] for b in bad] == [missing, "https://nowhere.invalid/no/repo"]
+    assert all(b["error"] and "packages" not in b for b in bad)
+
+
+def test_detect_finding_nothing_is_an_empty_list_not_an_error(client, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "README.md").write_text("# nothing to ship\n")
+    (found,) = client.post("/api/detect", json={"repos": [str(empty)]}).json()["repos"]
+    assert found["packages"] == [] and found["other"] == [] and "error" not in found
+
+
+def test_detect_validates_repos_like_the_scan_form(client, monorepo):
+    assert client.post("/api/detect", json={"repos": []}).status_code == 422
+    assert client.post("/api/detect", json={"repos": ["  "]}).status_code == 422
+    r = client.post("/api/detect", json={"repos": [str(monorepo), "not a repo"]})
+    assert r.status_code == 422
+    assert r.json()["detail"] == ["Repository 2 isn't a git URL or a local path (/…, ./…, ~/…)."]
+
+
+def test_detect_caps_how_many_repos_one_request_may_clone(client, tmp_path):
+    many = [str(tmp_path / f"r{i}") for i in range(11)]
+    r = client.post("/api/detect", json={"repos": many})
+    assert r.status_code == 422 and "At most 10" in r.json()["detail"][0]
+    assert client.post("/api/detect", json={"repos": many[:10]}).status_code == 200
+
+
+def test_detect_repeats_are_looked_up_once(store, cfg, monorepo):
+    seen = []
+    worker = ScanWorker(store, lambda s, i: None)
+    app = create_app(store, worker, detect=lambda repo: seen.append(repo) or {"repo": repo, "packages": []})
+    with TestClient(app, base_url="http://127.0.0.1:8080") as c:
+        r = c.post("/api/detect", json={"repos": [str(monorepo), f" {monorepo} "]})
+    worker.stop()
+    assert seen == [str(monorepo)] and len(r.json()["repos"]) == 1
+
+
+def test_detect_is_a_write_so_a_foreign_origin_is_refused(client, monorepo):
+    r = client.post("/api/detect", json={"repos": [str(monorepo)]}, headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    assert client.post("/api/detect", json={"repos": [str(monorepo)]},
+                       headers={"Origin": "http://localhost:8080"}).status_code == 200
+
+
+def test_two_detects_of_one_new_repo_at_once_both_succeed(monorepo):
+    """`clone` builds in `<dest>.partial` and renames it, so unserialised clones
+    of the same repo delete each other's work."""
+    import threading
+
+    from docrot.acquire.detect import detect
+    url = f"file://{monorepo}"
+    out: list[dict] = []
+    threads = [threading.Thread(target=lambda: out.append(detect(url))) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(out) == 4 and all("error" not in o and len(o["packages"]) == 2 for o in out)

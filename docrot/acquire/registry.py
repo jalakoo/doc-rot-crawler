@@ -1,6 +1,8 @@
 """Release lists straight from the package registry. No auth needed."""
 from __future__ import annotations
 
+import re
+
 import httpx
 from packaging.version import InvalidVersion, Version
 
@@ -23,7 +25,9 @@ def _pypi(package: str) -> list[Release]:
         return []
     out = []
     for label, files in r.json().get("releases", {}).items():
-        if not files:
+        # A yanked release is withdrawn - pip skips it unless pinned exactly -
+        # so it is never the "current" one a scan should verify against.
+        if not files or all(f.get("yanked") for f in files):
             continue
         out.append(Release(label=label, released_at=files[0].get("upload_time", "")[:10]))
     return _sorted(out)
@@ -35,13 +39,32 @@ def _npm(package: str) -> list[Release]:
         r.raise_for_status()
     except httpx.HTTPError:
         return []
-    times = r.json().get("time", {})
+    data = r.json()
+    times = data.get("time", {})
+    # `time` also lists versions since unpublished (and an `unpublished` entry
+    # that is an object, not a date); `versions` is what can still be installed.
+    live = set(data.get("versions") or times)
     out = [
         Release(label=k, released_at=v[:10])
         for k, v in times.items()
-        if k not in ("created", "modified")
+        if k in live and k not in ("created", "modified") and isinstance(v, str)
     ]
-    return _sorted(out)
+    return _with_latest(_sorted(out), (data.get("dist-tags") or {}).get("latest", ""))
+
+
+def _with_latest(rels: list[Release], latest: str) -> list[Release]:
+    """`dist-tags.latest` is what `npm install pkg` resolves, so it is the
+    newest stable release even when sorting disagrees: a `2.0.0` published
+    under the `next` tag sorts above it but is not what users get.
+
+    Stable releases above `latest` are dropped; pre-releases are left to
+    `pick_versions`, which excludes them anyway."""
+    labels = [r.label for r in rels]
+    if latest not in labels or is_prerelease(latest):
+        return rels
+    above = labels[labels.index(latest) + 1:]
+    drop = {label for label in above if not is_prerelease(label)}
+    return [r for r in rels if r.label not in drop]
 
 
 NUGET_REGISTRATION = "https://api.nuget.org/v3/registration5-gz-semver2/{id}/index.json"
@@ -76,16 +99,64 @@ def _nuget(package: str) -> list[Release]:
     return _sorted([r for r in out if r.label])
 
 
-def _sorted(rels: list[Release]) -> list[Release]:
-    def key(r: Release):
-        try:
-            return (0, Version(r.label))
-        except InvalidVersion:
-            return (1, r.label)
+_SEMVER = re.compile(r"^v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$")
+_PRE_RANK = {"a": "alpha", "b": "beta", "rc": "rc"}
+
+
+def _ids(tag: str) -> tuple:
+    """Semver pre-release identifiers: numeric ones compare as numbers and sort
+    before alphanumeric ones, which compare as text."""
+    return tuple((0, int(i)) if i.isdigit() else (1, i.lower()) for i in tag.split("."))
+
+
+def _release(parts) -> tuple:
+    out = list(parts)
+    while out and out[-1] == 0:          # 1.0 == 1.0.0 == 1.0.0.0
+        out.pop()
+    return tuple(out)
+
+
+def _key(label: str) -> tuple:
+    """Version precedence for any registry's label, in one comparable shape.
+
+    PEP 440 where the label parses, semver (npm, NuGet) where it does not -
+    `0.0.0-stage` is not PEP 440 and used to sort after every real release.
+    Within a release: dev < pre-release < final < post-release. A label that
+    is neither sorts oldest rather than newest."""
     try:
-        return sorted(rels, key=key)
-    except TypeError:
-        return sorted(rels, key=lambda r: r.released_at)
+        v = Version(label)
+    except InvalidVersion:
+        m = _SEMVER.match(label.strip())
+        if not m:
+            return ((-1,), (0, ((1, label),)))
+        pre = (1, _ids(m.group(2))) if m.group(2) else (2, ())
+        return (_release(int(p) for p in m.group(1).split(".")), pre)
+    phase: tuple
+    if v.pre:
+        phase = (1, ((1, _PRE_RANK[v.pre[0]]), (0, v.pre[1])))
+    elif v.dev is not None:
+        phase = (0, ((0, v.dev),))
+    elif v.post is not None:
+        phase = (3, ((0, v.post),))
+    else:
+        phase = (2, ())
+    return (_release(v.release), phase)
+
+
+def is_prerelease(label: str) -> bool:
+    """A release `pip`/`npm`/`nuget` would not pick by default, or one that is
+    not a real release at all: -rc, -beta, -preview, .dev, and build tags such
+    as `0.0.0-stage` or `1.1.1-local` (the Relate registries list both)."""
+    try:
+        v = Version(label)
+        return v.is_prerelease or v.is_devrelease or v.local is not None
+    except InvalidVersion:
+        m = _SEMVER.match(label.strip())
+        return not m or bool(m.group(2) or m.group(3))
+
+
+def _sorted(rels: list[Release]) -> list[Release]:
+    return sorted(rels, key=lambda r: _key(r.label))
 
 
 def pick_versions(rels: list[Release], want: int = 3,
@@ -100,29 +171,24 @@ def pick_versions(rels: list[Release], want: int = 3,
     three patches of one minor (8.0.6, 8.0.7, 8.0.8) agree on almost
     everything and hide the rot a 7.x release would expose.
 
-    Pre-releases are kept when the project publishes nothing else - excluding
-    them would leave some packages (perseus-client, for one) with no versions
-    at all.
+    Pre-releases and non-release builds (`0.0.0-stage`) are never chosen while
+    a stable release exists, unless the docs pin that exact version. A project
+    that publishes nothing else keeps them - excluding them would leave some
+    packages (perseus-client, `Relate.Net`) with no versions at all.
     """
     if not rels:
         return []
 
-    def is_pre(label: str) -> bool:
-        try:
-            return Version(label).is_prerelease
-        except InvalidVersion:
-            return False
-
-    stable = [r for r in rels if not is_pre(r.label)]
-    pool = stable if len(stable) >= want else rels
+    pinned = {_squash(m) for m in mentioned or []}
+    stable = [r for r in rels if not is_prerelease(r.label) or _squash(r.label) in pinned]
+    pool = _sorted(stable) if stable else _sorted(rels)
     if spread:
         pool = _spread(pool)
 
     picked: list[Release] = []
     if mentioned:
-        norm = {m.replace("-", "").replace("_", "").lower() for m in mentioned}
         for r in pool:
-            if r.label.replace("-", "").replace("_", "").lower() in norm:
+            if _squash(r.label) in pinned:
                 picked.append(r)
 
     for r in reversed(pool):
@@ -146,6 +212,10 @@ def pick_versions(rels: list[Release], want: int = 3,
         # same day as 8.0.8 - so the release date does not say which is latest.
         return _sorted(out)[-want:]
     return sorted(out, key=lambda r: r.released_at or "")[:want]
+
+
+def _squash(label: str) -> str:
+    return label.replace("-", "").replace("_", "").lower()
 
 
 def _spread(pool: list[Release]) -> list[Release]:

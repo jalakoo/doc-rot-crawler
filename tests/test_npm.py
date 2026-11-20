@@ -680,6 +680,27 @@ def test_a_bin_the_package_does_not_install_is_a_finding_before_anything_runs(wo
 
 
 @needs_node
+def test_a_bare_command_is_not_a_missing_bin_when_the_package_installs_none(world):
+    _pkg(world, "nobin", {"index.js": "module.exports = {};\n"}, {"main": "index.js"})
+    status, b = _verdict(world, "nobin", "nobin go --fast", "bash")
+    assert status == "unverified" and b["npm"] == []
+    assert "separate program" in b["notes"][0]
+    status, b = _verdict(world, "nobin", "npx nobin go", "bash")       # this one claims a bin
+    assert status == "fail" and b["npm"][0]["check"] == "bin"
+
+
+@needs_node
+def test_a_release_with_no_entry_point_is_unverified_not_a_missing_module(world):
+    _pkg(world, "reserved", {"README.md": "# reserved\n"}, {})
+    status, b = _verdict(world, "reserved", "const { Database } = require('reserved');", "js")
+    assert status == "unverified" and b["npm"] == []
+    assert "ships no entry point" in b["notes"][0]
+    _pkg(world, "typo-main", {"other.js": "module.exports = {};\n"}, {"main": "index.js"})
+    status, b = _verdict(world, "typo-main", "const { a } = require('typo-main');", "js")
+    assert status == "fail"                                            # it declares an entry it lacks
+
+
+@needs_node
 def test_the_probe_batches_many_snippets_in_one_process(world):
     plans, doc, bins = _probe(
         world, "esm-pkg",

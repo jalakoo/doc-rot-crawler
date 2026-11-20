@@ -357,7 +357,10 @@
     $("noticePhases").innerHTML = "";
     $("noticeDesc").innerHTML = never ? "Press <b>Re-run</b> to scan it."
       : esc(st.error || "The scan failed.") +
-        (last ? " Below is the last good run, from <b>" + esc(L.fmtAbs(last.at)) + "</b>." : "");
+        (last ? " Below is the last good run, from <b>" + esc(L.fmtAbs(last.at)) + "</b>." : "") +
+        (!never && /no package to verify/i.test(st.error || "")
+          ? '<button class="btn-ghost" type="button" data-fix="' + esc(s.id) + '">Detect packages and start a new scan</button>'
+          : "");
     buildLog(st.log, $("liveLog"), false);
   }
 
@@ -404,6 +407,8 @@
       "<span><b>" + (st.versions * countChains()) + "</b> sandboxes</span>" +
       "<span class='ok'>0 leaked</span>";
 
+    renderCoverage(L.coverageView(data.coverage));
+
     $("sources").innerHTML = data.sources.map(function (src) {
       var label = esc(L.shortSrc(src.url));
       return '<li class="' + src.kind + '"><span class="src-tag ' + src.kind + '">' + src.kind.toUpperCase() + "</span>" +
@@ -433,6 +438,26 @@
     buildTimeline();
     selectPage(worstPage());
     runImpact();
+  }
+
+  /* Checked vs not checked, and why not. Hidden for a report without `coverage`. */
+  function renderCoverage(view) {
+    $("coverage").hidden = !view;
+    if (!view) return;
+    var rows = [{ cls: "ok", n: view.checked, label: "checked", detail: "ran, or matched against the code" }]
+      .concat(view.reasons.map(function (r, i) {
+        return { cls: "r" + Math.min(i + 1, 3), n: r.n, label: r.label, detail: r.detail };
+      }));
+    $("covSum").innerHTML = "<span><b>" + view.total + "</b> snippets</span><span><b>" + view.checked +
+      "</b> checked</span><span><b>" + view.unchecked + "</b> not checked</span>";
+    $("covBar").setAttribute("aria-label", L.coverageSentence(view));
+    $("covBar").innerHTML = rows.filter(function (r) { return r.n; }).map(function (r) {
+      return '<i class="' + r.cls + '" style="flex:' + r.n + '"></i>';
+    }).join("");
+    $("covList").innerHTML = rows.map(function (r) {
+      return '<li class="' + r.cls + '"><i aria-hidden="true"></i><b>' + r.n + '</b><span class="why">' +
+        esc(r.label) + (r.detail ? "<small>" + esc(r.detail) + "</small>" : "") + "</span></li>";
+    }).join("");
   }
 
   function countChains() {
@@ -727,6 +752,8 @@
   document.addEventListener("click", function (e) {
     var ed = e.target.closest("[data-edit]");
     if (ed) { e.preventDefault(); beginEdit(ed); return; }
+    var fix = e.target.closest("[data-fix]");
+    if (fix) { openDialog(byId(fix.getAttribute("data-fix"))); return; }
     if (e.target.closest("[data-new]")) openDialog();
     if (e.target.closest("[data-import]")) openImport();
   });
@@ -771,16 +798,107 @@
     });
   }
 
-  function openDialog() {
+  /* `from` is a scan whose sources fill the form - the way out of a "no package
+     to verify" failure: the same repos, with Detect run on them at once. */
+  function openDialog(from) {
     form.reset();
+    detectRun++;
     $("docsRows").innerHTML = ""; $("repoRows").innerHTML = ""; $("pkgRows").innerHTML = "";
-    addRow("docs"); addRow("repo");
+    (from && from.docs.length ? from.docs : [""]).forEach(function (u) { addRow("docs", u); });
+    (from && from.repos.length ? from.repos : [""]).forEach(function (u) { addRow("repo", u); });
     $("formErr").textContent = "";
+    $("detect").disabled = false;
+    setDetectStatus("", false);
     form.querySelector(".opts").open = false;
     $("submitScan").disabled = false;
     dlg.showModal();
     rowsOf("docs")[0].focus();
+    if (from && from.repos.length) runDetect();
   }
+
+  /* ------------------------------------------------ detect packages */
+
+  var detectRun = 0;       // bumped when the form is reopened: an answer for the old form is dropped
+
+  function repoLis() { return Array.prototype.slice.call($("repoRows").children); }
+  function repoOf(li) { return li.querySelector('input[name="repo"]').value.trim(); }
+  function setDetectStatus(msg, busy) {
+    var el = $("detectStatus");
+    el.textContent = msg;
+    el.className = "detect-status" + (busy ? " busy" : "");
+  }
+  function clearFound(li) {
+    var old = li.querySelector(".found");
+    if (old) li.removeChild(old);
+    li.detection = null;
+    li.detectedFor = "";
+  }
+
+  /* One repo's answer, under its row. Only a repo that holds packages gets
+     checkboxes; the rest get a sentence saying what to do instead. */
+  function showFound(li, res) {
+    clearFound(li);
+    var h, ok = !res.error && res.packages.length;
+    if (res.error) {
+      h = '<p class="found-err">' + esc(res.error) + " You can still name a package by hand in the box beside the repo.</p>";
+    } else if (!res.packages.length) {
+      h = '<p class="found-err">No package found in this repo. Name one by hand in the box beside it, ' +
+          "or leave it empty to scan the repo's docs without one.</p>";
+    } else {
+      h = '<ul class="found-list">' + res.packages.map(function (p) {
+        var line = L.detectedLine(p);
+        return '<li><label><input type="checkbox" value="' + esc(p.spec) + '" checked><b>' + esc(line.name) +
+               '</b><span class="pkg-meta">' + esc(line.meta) + "</span></label></li>";
+      }).join("") + "</ul>";
+    }
+    var note = L.otherNote(res.other);
+    if (note) h += '<p class="found-note">' + esc(note) + "</p>";
+    var box = document.createElement("div");
+    box.className = "found" + (ok ? "" : " err");
+    box.setAttribute("role", "group");
+    box.setAttribute("aria-label", "Packages found in " + L.shortSrc(res.repo));
+    box.innerHTML = h;
+    li.appendChild(box);
+    li.detectedFor = res.repo;
+    li.detection = ok ? { specs: res.packages.map(function (p) { return p.spec; }) } : null;
+  }
+
+  function runDetect() {
+    var lis = repoLis().filter(repoOf), repos = [];
+    lis.forEach(function (li) { if (repos.indexOf(repoOf(li)) < 0) repos.push(repoOf(li)); });
+    if (!repos.length) {
+      setDetectStatus("Add a repository first, then look inside it.", false);
+      return rowsOf("repo")[0].focus();
+    }
+    var checked = L.checkSources([], repos);
+    if (checked.errors.length) {
+      return setDetectStatus(checked.errors.join(" "), false);
+    }
+    var run = ++detectRun;
+    $("detect").disabled = true;
+    setDetectStatus("Looking in " + plural(repos.length, "repo") + "… the first look at a large repo can take a minute.", true);
+    api("POST", "/api/detect", { repos: repos }).then(function (data) {
+      if (run !== detectRun) return;
+      var byRepo = {}, found = 0, failed = 0;
+      data.repos.forEach(function (r) { byRepo[r.repo] = r; });
+      repoLis().forEach(function (li) {
+        var res = byRepo[repoOf(li)];
+        if (!res) return;                       // edited while we looked
+        showFound(li, res);
+      });
+      data.repos.forEach(function (r) { if (r.error) failed++; else found += r.packages.length; });
+      setDetectStatus("Found " + plural(found, "package") + " in " + plural(data.repos.length - failed, "repo") +
+        (failed ? "; " + plural(failed, "repo") + " could not be read" : "") + ". Leave every box ticked and docrot " +
+        "picks the packages the docs mention; untick some to verify only the ticked ones.", false);
+      announce("Detection finished: " + plural(found, "package") + " found.");
+    }).catch(function (err) {
+      if (run === detectRun) setDetectStatus("Detect failed: " + err.messages.join(" "), false);
+    }).then(function () {
+      if (run === detectRun) $("detect").disabled = false;
+    });
+  }
+
+  $("detect").addEventListener("click", runDetect);
 
   form.addEventListener("click", function (e) {
     var add = e.target.closest("[data-add]");
@@ -809,6 +927,11 @@
 
   form.addEventListener("input", function (e) {
     if (e.target.getAttribute("aria-invalid") === "true") e.target.removeAttribute("aria-invalid");
+    // a different URL is a different repo: what was found no longer applies
+    if (e.target.name === "repo") {
+      var li = e.target.parentNode;
+      if (li.detectedFor && li.detectedFor !== e.target.value.trim()) clearFound(li);
+    }
   });
 
   function showErrors(messages, focusEl) {
@@ -821,8 +944,19 @@
     var docInputs = rowsOf("docs"), repoInputs = rowsOf("repo");
     var checked = L.checkSources(docInputs.map(function (i) { return i.value; }),
                                  repoInputs.map(function (i) { return i.value; }));
+    var picks = repoLis().map(function (li) {
+      if (!li.detection) return null;
+      var ticked = Array.prototype.map.call(li.querySelectorAll(".found input:checked"), function (c) { return c.value; });
+      return L.detectedPicks(li.detection.specs, ticked);
+    });
+    var typed = repoPackages();
+    var none = repoLis().filter(function (li, i) { return picks[i] && !picks[i].length && !typed[i].trim(); })[0];
+    if (none) {
+      return showErrors(["Tick at least one package for " + L.shortSrc(repoOf(none)) +
+                         ", or type one in the box beside the repo."], none.querySelector(".found input"));
+    }
     var pkgInputs = rowsOf("pkg"), packages = L.alignPackages(
-      repoInputs.map(function (i) { return i.value; }), repoPackages(), pkgInputs.map(function (i) { return i.value; }));
+      repoInputs.map(function (i) { return i.value; }), typed, pkgInputs.map(function (i) { return i.value; }), picks);
     docInputs.concat(repoInputs).forEach(function (i) { i.value = i.value.trim(); i.removeAttribute("aria-invalid"); });
     checked.invalid.docs.forEach(function (i) { docInputs[i].setAttribute("aria-invalid", "true"); });
     checked.invalid.repos.forEach(function (i) { repoInputs[i].setAttribute("aria-invalid", "true"); });

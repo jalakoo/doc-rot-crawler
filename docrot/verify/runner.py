@@ -68,6 +68,31 @@ TRANSIENT_INSTALL = re.compile(
     r"(connection reset|connection aborted|timed? ?out|temporary failure|"
     r"read timed out|proxyerror|incompleteread|502|503|504)", re.I)
 
+# The sandbox's shell and its installed packages are not the reader's. A glob
+# zsh will not expand (`pip install relate-db[arrow]`) or a program that is
+# not there (`relate`, a Rust binary no pip package installs) fails the same
+# way whatever the docs say.
+SHELL_ENVIRONMENT = re.compile(r"\b(?:zsh|bash|sh): no matches found|command not found", re.I)
+MISSING_MODULE = re.compile(r"ModuleNotFoundError: No module named '([\w.]+)'|"
+                            r"ImportError: cannot import name '[^']+' from '([\w.]+)'")
+
+
+def environmental(body: str, import_name: str = "") -> bool:
+    """Did the snippet die of its sandbox rather than of the package's API?
+
+    A module other than the package's own that is not installed, or lacks a
+    name the docs import, is the docs' *other* dependency (neo4j, a framework
+    that moved): a finding about someone else's package, not this one."""
+    if SHELL_ENVIRONMENT.search(body):
+        return True
+    root = import_name.split(".")[0] if import_name else ""
+    for m in MISSING_MODULE.finditer(body):
+        module = (m.group(1) or m.group(2) or "").split(".")[0]
+        if module and module != root:
+            return True
+    return False
+
+
 QUOTA_ERROR = re.compile(r"((cpu|memory|disk) limit exceeded|quota|too many sandboxes)", re.I)
 
 MAX_CONCURRENCY = 8          # account ceiling is 10 CPUs; 8 leaves headroom
@@ -240,7 +265,7 @@ def _render(rec: dict) -> str:
 # ---------------------------------------------------------------------------
 async def run_chain(daytona, chain: list[Snippet], package: str, version: str,
                     cfg: Config, sem: asyncio.Semaphore, log=print,
-                    install_spec: str = "") -> list[Result]:
+                    install_spec: str = "", import_name: str = "") -> list[Result]:
     """One sandbox per chain: these snippets establish state for each other."""
     secrets = cfg.secrets()
     async with sem:
@@ -276,7 +301,8 @@ async def run_chain(daytona, chain: list[Snippet], package: str, version: str,
                 status: Status
                 if r.exit_code == 0:
                     status = "pass"
-                elif CREDENTIAL_ERROR.search(body) or NETWORK_ERROR.search(body):
+                elif (CREDENTIAL_ERROR.search(body) or NETWORK_ERROR.search(body)
+                      or environmental(body, import_name)):
                     status = "unverified"
                 else:
                     status = "fail"
@@ -359,7 +385,7 @@ async def run_matrix(snippets: list[Snippet], package: str, import_name: str,
 
         tasks = [run_structural(daytona, structural, package, import_name,
                                 v, cfg, sem, log, install_spec) for v in versions]
-        tasks += [run_chain(daytona, c, package, v, cfg, sem, log, install_spec)
+        tasks += [run_chain(daytona, c, package, v, cfg, sem, log, install_spec, import_name)
                   for v in versions for c in exec_chains]
 
         got = await asyncio.gather(*tasks, return_exceptions=True)

@@ -11,6 +11,20 @@ from pydantic import BaseModel, Field
 Tier = Literal["execute", "structural", "unverifiable"]
 Status = Literal["pass", "fail", "blocked", "unverified"]
 
+# Why a snippet is `unverifiable`. One code per decision point, each with the
+# label a reader sees. A reader of the report cannot otherwise tell "we have no
+# Rust checker" from "this is a config file" from "this uses none of your
+# packages", and those call for different action.
+REASONS: dict[str, str] = {
+    "not-code": "not code",                                   # prose, config, data, diagrams, queries
+    "no-checker": "no checker",                               # a language docrot has no lane for
+    "other-language": "no package in that language",          # a lane exists, but not for this scan
+    "no-package-use": "use no scanned package",               # right language, nothing of ours used
+    "fragment": "fragments",                                  # an excerpt with nothing checkable
+    "not-declared": "declarations of names the package lacks",
+}
+UNRECORDED = "unrecorded"      # extraction.json from before reasons were kept
+
 
 class Snippet(BaseModel):
     id: str
@@ -24,6 +38,8 @@ class Snippet(BaseModel):
     kind: str = "program"                 # program | declaration | fragment
     declares: list[dict] = Field(default_factory=list)
     package: str = ""                     # distribution this snippet exercises
+    # why `tier` is unverifiable (a key of REASONS); empty for every other tier
+    reason: str = ""
 
 
 class Claim(BaseModel):
@@ -137,3 +153,26 @@ class Target(PackageRef):
     @property
     def labels(self) -> list[str]:
         return [v.label for v in self.versions]
+
+
+def coverage(snippets: list[Snippet]) -> dict:
+    """What was and was not checked, counted: by tier, by reason for the
+    unverifiable ones, and for `no-checker` by fence language. Used for the
+    extraction log and the report, so the two cannot disagree."""
+    tiers = {t: 0 for t in ("execute", "structural", "unverifiable")}
+    reasons: dict[str, int] = {}
+    langs: dict[str, int] = {}
+    for s in snippets:
+        tiers[s.tier] = tiers.get(s.tier, 0) + 1
+        if s.tier != "unverifiable":
+            continue
+        reason = s.reason or UNRECORDED
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if reason == "no-checker":
+            langs[s.lang] = langs.get(s.lang, 0) + 1
+    return {"tiers": tiers, "unverifiable": _by_count(reasons),
+            "no_checker": _by_count(langs)}
+
+
+def _by_count(counts: dict[str, int]) -> dict[str, int]:
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))

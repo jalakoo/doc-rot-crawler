@@ -25,6 +25,32 @@ def seed(dashboard, name="Seeded", docs=DOCS[:1], repos=REPOS[:1], runs=1):
     return rec
 
 
+RELATE = "https://github.com/relatedb/relate"
+FOUND = {"repo": RELATE, "commit": "abc123def456", "branch": "main", "other": ["rust", "go"],
+         "packages": [
+             {"name": "@relate/relate", "import_name": "@relate/relate", "ecosystem": "npm",
+              "path": "clients/javascript", "spec": "npm:@relate/relate"},
+             {"name": "relate-db", "import_name": "relate", "ecosystem": "pypi",
+              "path": "surfaces/relate-python", "spec": "pypi:relate-db"},
+             {"name": "Relate.Net", "import_name": "Relate.Net", "ecosystem": "nuget",
+              "path": "clients/dotnet/src/Relate.Net", "spec": "nuget:Relate.Net"}]}
+
+COVERAGE = {"tiers": {"execute": 4, "structural": 10, "unverifiable": 172},
+            "unverifiable": {"no-package": 120, "not-code": 35, "no-checker": 17},
+            "no_checker": {"rust": 9, "go": 8},
+            "labels": {"no-package": "use no scanned package", "not-code": "not code",
+                       "no-checker": "no checker"},
+            "pages": {}}
+
+
+def open_form_with_repo(page: Page, dashboard, repo: str = RELATE):
+    page.goto(dashboard.url)
+    page.locator(".toolbar [data-new]").click()
+    page.get_by_role("textbox", name="Docs URL 1", exact=True).fill(DOCS[0])
+    page.get_by_role("textbox", name="Repository 1", exact=True).fill(repo)
+    return page.locator("#dlg")
+
+
 def card(page: Page, name: str):
     return page.locator("article.card").filter(has=page.get_by_role("link", name=name, exact=True))
 
@@ -294,3 +320,175 @@ def test_settings_are_saved_to_the_keychain_and_never_shown_back(page: Page, das
     page.get_by_role("link", name=re.compile("All scans")).click()
     expect(page.locator("#viewList")).to_be_visible()
     expect(page.locator("#viewSettings")).to_be_hidden()
+
+
+# ------------------------------------------------------------- detect packages
+
+def test_detect_then_untick_one_sends_the_ticked_packages_with_their_ecosystem(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+
+    group = page.get_by_role("group", name="Packages found in relatedb/relate")
+    expect(group.get_by_role("checkbox")).to_have_count(3)
+    for box in group.get_by_role("checkbox").all():
+        expect(box).to_be_checked()
+    expect(group).to_contain_text("relate-db")
+    expect(group).to_contain_text("PyPI · import relate · surfaces/relate-python")
+    expect(group).to_contain_text("Also contains Rust and Go — no checker for them yet.")
+    expect(page.locator("#detectStatus")).to_contain_text("Found 3 packages in 1 repo")
+
+    group.get_by_role("checkbox", name="@relate/relate").uncheck()
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [["pypi:relate-db", "nuget:Relate.Net"]]
+    assert [r.options.ecosystem for r in dashboard.store.all()] == ["auto"]
+
+
+def test_detect_and_leave_every_box_ticked_sends_no_packages(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    expect(page.get_by_role("checkbox")).to_have_count(3)
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [[]]
+
+
+def test_a_typed_package_and_the_ticked_ones_are_sent_together(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    page.get_by_role("checkbox", name="Relate.Net").uncheck()
+    page.get_by_role("checkbox", name="relate-db").uncheck()
+    page.get_by_role("textbox", name="Package for repository 1", exact=True).fill("by-hand")
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [["by-hand", "npm:@relate/relate"]]
+
+
+def test_unticking_everything_asks_for_a_package(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    expect(page.get_by_role("checkbox")).to_have_count(3)
+    for box in page.get_by_role("checkbox").all():
+        box.uncheck()
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(page.locator("#formErr")).to_contain_text("Tick at least one package for relatedb/relate")
+    assert dashboard.store.all() == []
+
+
+def test_editing_the_repo_after_detecting_drops_what_was_found(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    page.get_by_role("checkbox", name="relate-db").uncheck()
+    page.get_by_role("textbox", name="Repository 1", exact=True).fill(RELATE + "-fork")
+    expect(page.locator(".found")).to_have_count(0)
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [[]]       # nothing stale is sent
+
+
+def test_a_repo_that_cannot_be_read_shows_its_error_beside_it(page: Page, dashboard):
+    dialog = open_form_with_repo(page, dashboard, "https://github.com/a/private")
+    dialog.get_by_role("button", name="Detect packages").click()
+    found = page.locator(".found")
+    expect(found).to_contain_text("repository not found.")
+    expect(found).to_contain_text("name a package by hand")
+    expect(found.get_by_role("checkbox")).to_have_count(0)
+    # the scan can still be started and is not blocked by a failed look
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [[]]
+
+
+def test_detect_with_no_repo_says_to_add_one(page: Page, dashboard):
+    page.goto(dashboard.url)
+    page.locator(".toolbar [data-new]").click()
+    page.locator("#dlg").get_by_role("button", name="Detect packages").click()
+    expect(page.locator("#detectStatus")).to_have_text("Add a repository first, then look inside it.")
+    assert dashboard.detected == []
+
+
+def test_ecosystem_defaults_to_auto_detect(page: Page, dashboard):
+    page.goto(dashboard.url)
+    page.locator(".toolbar [data-new]").click()
+    page.locator("summary").filter(has_text="Scan options").click()
+    eco = page.get_by_label("Ecosystem")
+    expect(eco).to_have_value("auto")
+    expect(eco.locator("option").first).to_have_text("Auto-detect")
+
+
+def test_a_no_package_failure_offers_detect_with_the_sources_filled_in(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    rec = dashboard.store.create(DOCS[:1], [RELATE], name="Relate")
+    dashboard.fail_next = "no package to verify - name one"
+    dashboard.worker.enqueue(rec.id)
+    dashboard.worker.join()
+
+    page.goto(f"{dashboard.url}/#/scan/{rec.id}")
+    page.get_by_role("button", name="Detect packages and start a new scan").click()
+    expect(page.locator("#dlg")).to_be_visible()
+    expect(page.get_by_role("textbox", name="Repository 1", exact=True)).to_have_value(RELATE)
+    expect(page.get_by_role("textbox", name="Docs URL 1", exact=True)).to_have_value(DOCS[0])
+    expect(page.get_by_role("checkbox")).to_have_count(3)
+
+
+def test_other_failures_do_not_offer_it(page: Page, dashboard):
+    rec = dashboard.store.create(DOCS[:1], REPOS[:1], name="Flaky")
+    dashboard.fail_next = "no pages acquired"
+    dashboard.worker.enqueue(rec.id)
+    dashboard.worker.join()
+    page.goto(f"{dashboard.url}/#/scan/{rec.id}")
+    expect(page.locator("#noticeDesc")).to_contain_text("no pages acquired")
+    expect(page.get_by_role("button", name="Detect packages and start a new scan")).to_have_count(0)
+
+
+def test_detect_form_has_no_horizontal_scroll_on_a_phone(page: Page, dashboard):
+    dashboard.detections[RELATE] = FOUND
+    page.set_viewport_size({"width": 400, "height": 800})
+    dialog = open_form_with_repo(page, dashboard)
+    dialog.get_by_role("button", name="Detect packages").click()
+    expect(page.get_by_role("checkbox")).to_have_count(3)
+    assert page.evaluate("document.documentElement.scrollWidth") <= 400
+    assert page.evaluate("document.getElementById('dlg').scrollWidth <= document.getElementById('dlg').clientWidth")
+
+
+# ------------------------------------------------------------------ coverage
+
+def seed_with_coverage(dashboard, coverage, name="Covered"):
+    docs, repos = DOCS[:1], REPOS[:1]
+    rec = dashboard.store.create(docs, repos, name=name)
+    out = make_outcome(docs, repos)
+    if coverage is None:
+        out.report.pop("coverage", None)
+    else:
+        out.report["coverage"] = coverage
+    dashboard.store.save_run(rec.id, out.report, [r.model_dump() for r in out.results],
+                             out.extraction.model_dump_json())
+    dashboard.store.set_status(rec.id, ScanStatus(state="done"))
+    return rec
+
+
+def test_the_detail_view_shows_what_was_not_checked_and_why(page: Page, dashboard):
+    rec = seed_with_coverage(dashboard, COVERAGE)
+    page.goto(f"{dashboard.url}/#/scan/{rec.id}")
+    panel = page.locator("#coverage")
+    expect(panel).to_be_visible()
+    expect(page.locator("#covSum").locator("span")).to_have_text(["186 snippets", "14 checked", "172 not checked"])
+    items = page.locator("#covList li")
+    expect(items).to_have_count(4)
+    expect(items.nth(0)).to_contain_text("14checked")
+    expect(items.nth(1)).to_contain_text("120use no scanned package")
+    expect(items.nth(3)).to_contain_text("17no checker")
+    expect(items.nth(3)).to_contain_text("rust 9, go 8")
+    expect(page.locator("#covBar")).to_have_attribute("aria-label", re.compile("186 snippets · 14 checked · 172 not checked: 120 use"))
+
+
+def test_a_report_without_coverage_hides_the_panel(page: Page, dashboard):
+    rec = seed_with_coverage(dashboard, None, name="Old")
+    page.goto(f"{dashboard.url}/#/scan/{rec.id}")
+    expect(page.locator("#map .tile").first).to_be_visible()
+    expect(page.locator("#coverage")).to_be_hidden()

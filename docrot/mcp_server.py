@@ -47,6 +47,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field, ValidationError
 
 from . import config as cfgmod
+from .acquire.detect import detect as detect_repo
 from .report import export
 from .report.diff import diff, exit_code, load_results
 from .store import (
@@ -56,11 +57,13 @@ from .store import (
     Store,
     align_packages,
     clean_sources,
+    is_repo,
     now,
 )
 from .worker import AlreadyActive, ScanWorker
 
 LOG_TAIL = 20           # log lines get_scan returns: enough to see what a scan is doing
+MAX_DETECT = 10         # repos per detect_packages call: each may be a clone
 MAX_LIMIT = 200         # findings per page, however much the caller asks for
 KNOWN_IDS_SHOWN = 15    # ids listed in an "unknown scan" error
 FINDING_KINDS = (*export.DRIFT_KINDS, "blocked")
@@ -118,9 +121,18 @@ class ScanStatusView(BaseModel):
     runs: list[RunBrief] = Field(description="finished runs, oldest first")
 
 
+class Coverage(BaseModel):
+    tiers: dict[str, int] = Field(description="snippets by how far they were checked: execute, structural, unverifiable")
+    unverifiable: dict[str, int] = Field(description="why snippets were not checked: reason code -> count, largest first")
+    no_checker: dict[str, int] = Field(description="fence languages docrot has no checker for -> count")
+
+
 class FindingsPage(BaseModel):
     scan_id: str
     run_id: str
+    coverage: Coverage | None = Field(None, description=(
+        "what the run did NOT check, and why. Zero findings with a large `unverifiable` count is not "
+        "'clean'. null for runs from before this was recorded"))
     total: int = Field(description="findings matching the filters, across all pages")
     offset: int
     returned: int
@@ -169,6 +181,29 @@ class RenameImpact(BaseModel):
     note: str = ""
 
 
+class DetectedPackage(BaseModel):
+    name: str
+    ecosystem: str = Field(description="pypi, npm or nuget")
+    import_name: str
+    path: str = Field(description="folder inside the repo; empty for the root")
+    spec: str = Field(description="<ecosystem>:<name>: pass this in start_scan's packages to verify exactly it")
+
+
+class DetectedRepo(BaseModel):
+    repo: str
+    commit: str = ""
+    branch: str = ""
+    packages: list[DetectedPackage] = Field(default_factory=list)
+    other: list[str] = Field(default_factory=list, description=(
+        "ecosystems the repo also holds that docrot has no checker for (rust, go, java, ...)"))
+    error: str = ""
+    note: str = ""
+
+
+class Detected(BaseModel):
+    repos: list[DetectedRepo]
+
+
 class Queued(BaseModel):
     scan_id: str
     name: str
@@ -204,14 +239,18 @@ RunId = Annotated[str | None, Field(description="a run id from get_scan; default
 INSTRUCTIONS = """\
 docrot checks documentation against the code it documents, across releases, and reports where they disagree.
 Read first: list_scans, then get_findings / scan_diff / rename_impact on a scan id.
+Before start_scan on a repo you do not know, call detect_packages: a monorepo holds several packages \
+and a scan verifies only the ones named, or else the ones the docs mention.
 start_scan and rerun_scan spend sandbox time and model credit and run for minutes; only one scan runs at a \
 time, and you follow it with get_scan."""
 
 
-def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = None) -> MCPServer:
+def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = None,
+                 detect: Callable[[str], dict] = detect_repo) -> MCPServer:
     """The server, over a store and a worker handed in - tests pass a temp store
     and a fake runner, as tests/test_api.py does for the HTTP app. `blast` is
-    the Neo4j lookup behind rename_impact's fallback."""
+    the Neo4j lookup behind rename_impact's fallback; `detect` the clone-and-
+    look behind detect_packages."""
     server = MCPServer("docrot", instructions=INSTRUCTIONS, log_level="WARNING")
     lookup = blast or graph_blast_radius
     # check-then-queue must be atomic within this process; across processes it
@@ -304,6 +343,7 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
             raise ToolError(f"Unknown kind {', '.join(map(repr, unknown))}. "
                             f"Valid: {', '.join((*FINDING_KINDS, *CLEAN_KINDS))}.")
         run, *_ = newest(rec.id, run_id)
+        cov = (store.report(rec.id, run.id) or {}).get("coverage")
         records = store.export(rec.id, run.id, include_clean=any(k in CLEAN_KINDS for k in wanted))
         assert records is not None
         next(records)                                   # the scan record, not a finding
@@ -316,7 +356,9 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
         window = hits[offset:offset + limit]
         more = offset + len(window) < len(hits)
         return reply(FindingsPage(
-            scan_id=rec.id, run_id=run.id, total=len(hits), offset=offset, returned=len(window),
+            scan_id=rec.id, run_id=run.id, coverage=Coverage(**{k: cov.get(k) or {} for k in
+                                                                ("tiers", "unverifiable", "no_checker")})
+            if cov else None, total=len(hits), offset=offset, returned=len(window),
             next_offset=offset + len(window) if more else None, by_kind=by_kind, findings=window))
 
     @server.tool(annotations=READ, title="What changed since the previous run")
@@ -421,6 +463,42 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
                             queued_behind=ahead,
                             next=f"Scans take minutes. Poll get_scan({scan_id!r}), then call get_findings."))
 
+    @server.tool(annotations=READ, title="Detect packages in repos")
+    def detect_packages(
+        repos: Annotated[list[str], Field(description=(
+            f"up to {MAX_DETECT} git URLs or local paths (/..., ./..., ~/...) to look in"))],
+    ) -> Annotated[CallToolResult, Detected]:
+        """Which publishable packages a repo holds, found by reading its manifests.
+
+        Call this BEFORE start_scan on a repo you do not know: monorepos ship
+        several packages (e.g. PyPI + npm + NuGet) and a scan can only verify
+        what it is pointed at. Pass the `spec` of the ones you want as
+        start_scan's `packages` (positionally: packages[i] for repos[i]); name
+        none and the scan picks the found packages the docs mention (at most 6 per repo; if the docs
+        mention none, the single best one). `other`
+        lists ecosystems docrot cannot check yet. Clones the repo (cached, so
+        later calls take a second; the first can take up to a minute) but runs
+        no sandbox and spends no model credit. An unreachable repo comes back
+        as an entry with `error`, not a failure.
+        """
+        wanted = list(dict.fromkeys(r.strip() for r in repos if r and r.strip()))
+        if not wanted:
+            raise ToolError("repos is empty; pass at least one git URL or local path.")
+        if len(wanted) > MAX_DETECT:
+            raise ToolError(f"At most {MAX_DETECT} repos per call; got {len(wanted)}.")
+        bad = [f"Repository {i} ({r!r}) isn't a git URL or a local path (/..., ./..., ~/...)."
+               for i, r in enumerate(wanted, 1) if not is_repo(r)]
+        if bad:
+            raise ToolError(" ".join(bad))
+        out = []
+        for found in map(detect, wanted):
+            entry = DetectedRepo(**found)
+            if not entry.error and not entry.packages:
+                entry.note = ("No package found. If the repo has one, name it in start_scan's packages "
+                              "(with the ecosystem set, or as pypi:/npm:/nuget:name).")
+            out.append(entry)
+        return reply(Detected(repos=out))
+
     @server.tool(annotations=ACT, title="Start a scan")
     def start_scan(
         docs: Annotated[list[str], Field(description=(
@@ -429,12 +507,20 @@ def build_server(store: Store, worker: ScanWorker, blast: BlastRadius | None = N
             "git URLs or local paths (/..., ./..., ~/...) of the code the docs describe; may be empty "
             "if packages names what to check"))],
         packages: Annotated[list[str] | None, Field(description=(
-            "package names, matched to repos by position: packages[0] belongs to repos[0]. Use \"\" to "
-            "let docrot infer a repo's package. Names past the last repo are packages with no repo, "
-            "fetched from the registry. Omit to infer everything"))] = None,
+            "package names, matched to repos by position: packages[0] belongs to repos[0]. A name may carry "
+            "an ecosystem prefix - pypi:relate-db, npm:@relate/relate, nuget:Relate.Net (see "
+            "detect_packages, whose `spec` is exactly this). Naming restricts: if any entry names a package "
+            "found in a repo, that repo verifies exactly the named ones (extra entries past the last repo "
+            "may also name a package of an earlier repo, to verify several from one); if none is named for "
+            "a repo, docrot picks the packages found there that the docs mention (install commands, imports, "
+            "using lines, distinctive names), most mentioned first, at most 6 per repo; named packages are "
+            "never capped. Use \"\" to "
+            "leave a repo's slot unnamed. An entry naming no package of any repo is fetched from the "
+            "registry; one name on two registries is verified once, on the first. Omit to infer everything"))] = None,
         name: Annotated[str | None, Field(description="display name; default: derived from the first source")] = None,
-        ecosystem: Annotated[Literal["pypi", "npm", "nuget"], Field(description=(
-            "registry for a package with no repo, or whose repo has no package metadata"))] = "pypi",
+        ecosystem: Annotated[Literal["auto", "pypi", "npm", "nuget"], Field(description=(
+            "auto (default): the repo's manifests decide. It only matters for a package named without a "
+            "repo and without a prefix, which has no manifest: then set the registry to fetch it from"))] = "auto",
         versions: Annotated[int, Field(ge=1, le=10, description="releases to test each package against")] = 3,
         max_pages: Annotated[int | None, Field(ge=1, le=2000, description="crawl cap per docs site")] = None,
         assume_credentialed: Annotated[bool, Field(description=(

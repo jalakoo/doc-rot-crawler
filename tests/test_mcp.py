@@ -25,7 +25,7 @@ from docrot.worker import ScanWorker
 from tests.fakes import fake_runner, run_async
 
 DOCS, REPO = "https://docs.a.io", "https://github.com/a/alpha"
-READ_ONLY = {"list_scans", "get_scan", "get_findings", "scan_diff", "rename_impact"}
+READ_ONLY = {"list_scans", "get_scan", "get_findings", "scan_diff", "rename_impact", "detect_packages"}
 ACTIONS = {"start_scan", "rerun_scan"}
 
 
@@ -35,8 +35,10 @@ class Agent:
     def __init__(self, store, cfg):
         self.store, self.mode = store, {"failing": True, "gate": None}
         self.graph_rows: list[dict] = []
+        self.detected: dict[str, dict] = {}         # repo -> what detect_packages' lookup answers
         self.worker = ScanWorker(store, self._execute)
-        self.server = build_server(store, self.worker, blast=lambda symbol: self.graph_rows)
+        self.server = build_server(store, self.worker, blast=lambda symbol: self.graph_rows,
+                                   detect=lambda repo: self.detected.get(repo, {"repo": repo, "packages": []}))
         self.cfg = cfg
 
     def _execute(self, store, scan_id):
@@ -109,7 +111,18 @@ def test_tools_are_listed_with_hints_and_described_arguments(agent):
     start = tools["start_scan"].description
     assert "minutes" in start and "credit" in start and "get_scan" in start
     assert set(tools["start_scan"].input_schema["required"]) == {"docs", "repos"}
-    assert tools["start_scan"].input_schema["properties"]["ecosystem"]["enum"] == ["pypi", "npm", "nuget"]
+    eco = tools["start_scan"].input_schema["properties"]["ecosystem"]
+    assert eco["enum"] == ["auto", "pypi", "npm", "nuget"] and eco["default"] == "auto"
+    assert "only matters" in eco["description"]
+    packages = tools["start_scan"].input_schema["properties"]["packages"]["description"]
+    assert "npm:@relate/relate" in packages and "restricts" in packages and "detect_packages" in packages
+    detect = tools["detect_packages"].description
+    assert "BEFORE start_scan" in detect and "no sandbox" in detect
+
+
+def test_the_server_instructions_send_agents_to_detect_first(agent):
+    from docrot.mcp_server import INSTRUCTIONS
+    assert "detect_packages" in INSTRUCTIONS
 
 
 def test_results_are_compact_json_not_indented(agent):
@@ -416,6 +429,71 @@ def test_interrupted_scans_are_failed_but_only_ours(store):
     st = store.status(ours)
     assert st.state == "failed" and "MCP server stopped" in st.error and st.finished_at
     assert store.status(theirs).state == "running"          # a live dashboard's scan is not ours to fail
+
+
+# ------------------------------------------------------------------ detect_packages
+
+FOUND = {"repo": REPO, "commit": "abc123def456", "branch": "main",
+         "packages": [{"name": "relate-db", "import_name": "relate", "ecosystem": "pypi",
+                       "path": "surfaces/relate-python", "spec": "pypi:relate-db"},
+                      {"name": "@relate/relate", "import_name": "@relate/relate", "ecosystem": "npm",
+                       "path": "clients/javascript", "spec": "npm:@relate/relate"}],
+         "other": ["rust"]}
+
+
+def test_detect_packages_lists_what_a_repo_holds_compactly(agent):
+    agent.detected[REPO] = FOUND
+    data = agent.ok("detect_packages", repos=[REPO])
+    assert "\n" not in agent.last_text
+    (repo,) = data["repos"]
+    assert [p["spec"] for p in repo["packages"]] == ["pypi:relate-db", "npm:@relate/relate"]
+    assert repo["other"] == ["rust"] and repo["error"] == "" and repo["note"] == ""
+
+
+def test_detect_packages_says_what_to_do_when_nothing_is_found_or_the_repo_is_unreadable(agent):
+    agent.detected["/tmp/empty"] = {"repo": "/tmp/empty", "packages": [], "other": []}
+    agent.detected["/tmp/gone"] = {"repo": "/tmp/gone", "error": "repository not found"}
+    a, b = agent.ok("detect_packages", repos=["/tmp/empty", "/tmp/gone"])["repos"]
+    assert "No package found" in a["note"] and a["error"] == ""
+    assert b["error"] == "repository not found" and b["packages"] == [] and b["note"] == ""
+
+
+def test_detect_packages_validates_its_input_like_start_scan(agent):
+    assert "empty" in agent.fails("detect_packages", repos=[])
+    assert "At most 10" in agent.fails("detect_packages", repos=[f"/tmp/r{i}" for i in range(11)])
+    assert "Repository 1" in agent.fails("detect_packages", repos=["nope"])
+
+
+def test_detect_packages_runs_the_real_lookup_on_a_local_repo(store, cfg, tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    root = tmp_path / "mono"
+    (root / "monopy").mkdir(parents=True)
+    (root / "pyproject.toml").write_text('[project]\nname = "mono-py"\n')
+    (root / "monopy" / "__init__.py").write_text("def go(): ...\n")
+    (root / "Cargo.toml").write_text("[package]\n")
+    worker = ScanWorker(store, lambda s, i: None)
+    try:
+        server = build_server(store, worker)
+
+        async def go():
+            async with Client(server) as c:
+                return (await c.call_tool("detect_packages", {"repos": [str(root)]})).structured_content
+        (found,) = run_async(go())["repos"]
+    finally:
+        worker.stop()
+    assert [p["spec"] for p in found["packages"]] == ["pypi:mono-py"] and found["other"] == ["rust"]
+
+
+def test_get_findings_carries_the_runs_coverage_when_the_report_has_it(agent, store):
+    scan_id = agent.scan()
+    run = store.runs(scan_id)[-1]
+    assert agent.ok("get_findings", scan_id=scan_id)["coverage"]["tiers"]
+    path = store.run_dir(scan_id, run.id) / "report.json"
+    report = json.loads(path.read_text())
+    report.pop("coverage", None)                    # a run from before coverage was recorded
+    path.write_text(json.dumps(report))
+    assert agent.ok("get_findings", scan_id=scan_id)["coverage"] is None
 
 
 # ---------------------------------------------------------------------- credentials

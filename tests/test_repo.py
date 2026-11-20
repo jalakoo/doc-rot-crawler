@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import ClassVar
@@ -379,3 +380,209 @@ def test_a_failed_widening_is_logged_not_raised(tmp_path, monkeypatch):
     said = []
     assert repo.ensure_sources(path, "npm", log=said.append) is False
     assert "timed out" in said[0]
+
+
+# ------------------------------------------------- every package in a checkout
+def _relate(tmp_path):
+    """Relate's shape: three real packages, and every decoy its repo holds."""
+    root = tmp_path / "relate"
+    _write(root, "surfaces/relate-python/pyproject.toml",
+           '[build-system]\nrequires = ["maturin"]\n[project]\nname = "relate-db"\n'
+           '[tool.maturin]\nmodule-name = "relate._native"\npython-source = "python"\n')
+    _write(root, "surfaces/relate-python/python/relate/__init__.py", "")
+    _write(root, "surfaces/relate-python/python/tests/test_x.py", "")
+    _write(root, "clients/javascript/package.json", json.dumps({
+        "name": "@relate/relate",
+        "optionalDependencies": {"@relate/relate-linux-x64": "file:platforms/linux-x64",
+                                 "@relate/relate-darwin-arm64": "file:platforms/darwin-arm64"}}))
+    for plat in ("linux-x64", "darwin-arm64"):
+        _write(root, f"clients/javascript/platforms/{plat}/package.json",
+               json.dumps({"name": f"@relate/relate-{plat}"}))
+    _write(root, "docs/api/bolt/examples/websocket/package.json", '{"name": "ws-example"}')
+    pkg = "<PackageId>Relate.Net</PackageId><Version>1.1.1-local</Version>"
+    _csproj(root / "clients/dotnet/src/Relate.Net/Relate.Net.csproj", pkg)
+    _csproj(root / "clients/dotnet/tests/Relate.Net.Tests/Relate.Net.Tests.csproj")
+    _csproj(root / "docs/api/dotnet/examples/Relate.Examples.csproj", "<OutputType>Exe</OutputType>")
+    _write(root, "crates/core/Cargo.toml", "[package]\nname = 'relate-core'\n")
+    return root
+
+
+def _csproj(path, body=""):
+    _write(path.parent, path.name, f'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>{body}'
+                                    "</PropertyGroup></Project>")
+
+
+def test_find_packages_returns_exactly_the_three_relate_packages(tmp_path):
+    from docrot.acquire.repo import find_packages
+    root = _relate(tmp_path)
+    got = find_packages(root, hint="relate")
+    assert [(p.name, p.import_name, p.ecosystem, p.root.relative_to(root).as_posix()) for p in got] == [
+        ("@relate/relate", "@relate/relate", "npm", "clients/javascript"),    # named like the repo
+        ("relate-db", "relate", "pypi", "surfaces/relate-python/python"),     # then shallower
+        ("Relate.Net", "Relate.Net", "nuget", "clients/dotnet/src/Relate.Net"),
+    ]
+    assert [p.name for p in find_packages(root)] == ["@relate/relate", "relate-db", "Relate.Net"]  # by depth
+
+
+def test_find_packages_ranks_by_how_often_the_docs_mention_a_name(tmp_path):
+    from docrot.acquire.repo import find_packages
+    docs = "Relate.Net Relate.Net relate-db"
+    got = find_packages(_relate(tmp_path), hint="other", rank=docs.count)
+    assert [p.name for p in got] == ["Relate.Net", "relate-db", "@relate/relate"]
+
+
+def test_find_package_keeps_the_python_distribution_name_apart_from_the_import(tmp_path):
+    from docrot.acquire.repo import find_package
+    root = _relate(tmp_path)
+    assert find_package(root, hint="relate") == (
+        "relate-db", "relate", "pypi", root / "surfaces/relate-python/python")
+    assert find_package(root, want="Relate.Net")[:3] == ("Relate.Net", "Relate.Net", "nuget")
+    assert find_package(root, want="@relate/relate")[2] == "npm"
+
+
+def _py(tmp_path, name, pyproject, *dirs):
+    root = tmp_path / name
+    _write(root, "pyproject.toml", pyproject)
+    for d in dirs:
+        _write(root, f"{d}/__init__.py", "")
+    return root
+
+
+def test_import_name_comes_from_build_metadata(tmp_path):
+    from docrot.acquire.repo import find_packages
+    cases = {
+        "maturin": (_py(tmp_path, "m", '[project]\nname = "relate-db"\n[tool.maturin]\n'
+                        'module-name = "relate._native"\npython-source = "python"\n', "python/relate"),
+                    ("relate", "python")),
+        "hatch": (_py(tmp_path, "h", '[project]\nname = "acme-sdk"\n[tool.hatch.build.targets.wheel]\n'
+                      'packages = ["src/acme"]\n', "src/acme"), ("acme", "src")),
+        "poetry": (_py(tmp_path, "p", '[tool.poetry]\nname = "acme-sdk"\npackages = '
+                       '[{include = "acme", from = "lib"}]\n', "lib/acme"), ("acme", "lib")),
+        "setuptools package-dir": (_py(tmp_path, "s", '[project]\nname = "acme-sdk"\n'
+                                       '[tool.setuptools]\npackages = ["acme", "acme.sub"]\n'
+                                       '[tool.setuptools.package-dir]\n"" = "pysrc"\n', "pysrc/acme"),
+                                   ("acme", "pysrc")),
+        "setuptools find": (_py(tmp_path, "f", '[project]\nname = "acme-sdk"\n[tool.setuptools.packages.find]\n'
+                                'where = ["src"]\n', "src/acme"), ("acme", "src")),
+        "flit": (_py(tmp_path, "l", '[project]\nname = "acme-sdk"\n[tool.flit.module]\nname = "acme"\n',
+                     "src/acme"), ("acme", "src")),
+        "no metadata, a guess": (_py(tmp_path, "g", '[project]\nname = "acme-sdk"\n', "acme_sdk"),
+                                 ("acme_sdk", "")),
+    }
+    for label, (root, (imp, sub)) in cases.items():
+        (pkg,) = find_packages(root)
+        assert (pkg.import_name, pkg.root) == (imp, root / sub if sub else root), label
+
+
+def test_a_pyproject_that_only_configures_tools_is_not_a_package(tmp_path):
+    from docrot.acquire.repo import find_packages
+    root = _py(tmp_path, "r", '[tool.ruff]\nline-length = 100\n')
+    assert find_packages(root) == []
+    dev = tmp_path / "dev"
+    _write(dev, "pyproject.toml", '[project]\nname = "mono-dev"\nversion = "0.0.0"\n')
+    _write(dev, "lib/pyproject.toml", '[project]\nname = "mono"\n')
+    _write(dev, "lib/mono/__init__.py", "")
+    _write(dev, "lib/other/__init__.py", "")           # a stray package must not make it one
+    assert [p.name for p in find_packages(dev)] == ["mono"]
+
+
+def test_a_private_npm_workspace_root_yields_its_public_members(tmp_path):
+    from docrot.acquire.repo import find_packages
+    got = find_packages(_workspace(tmp_path))
+    assert sorted(p.name for p in got) == ["@momentic/wizard", "gen-tool", "momentic"]
+
+
+def test_npm_platform_packages_are_dropped_even_when_not_listed_with_file_paths(tmp_path):
+    from docrot.acquire.repo import find_packages
+    root = tmp_path / "bin"
+    _write(root, "package.json", json.dumps({"name": "tool", "optionalDependencies": {"tool-linux": "1.0.0"}}))
+    _write(root, "npm/linux/package.json", '{"name": "tool-linux"}')
+    _write(root, "npm/inside/package.json", '{"name": "tool-inside"}')   # under a public package
+    assert [p.name for p in find_packages(root)] == ["tool"]
+
+
+def test_duende_style_client_samples_stay_out_but_a_client_library_with_a_package_id_is_in(tmp_path):
+    from docrot.acquire.repo import find_packages
+    root = tmp_path / "products"
+    _csproj(root / "identity-server/src/IdentityServer/IdentityServer.csproj",
+            "<PackageId>Duende.IdentityServer</PackageId>")
+    _csproj(root / "identity-server/clients/src/ConsoleCode/ConsoleCode.csproj")
+    _csproj(root / "identity-server/clients/src/Constants/Constants.csproj")           # a library, unpacked
+    _csproj(root / "clients/dotnet/src/Acme.Client/Acme.Client.csproj", "<PackageId>Acme.Client</PackageId>")
+    _csproj(root / "clients/dotnet/samples/Demo/Demo.csproj", "<PackageId>Acme.Demo</PackageId>")
+    assert sorted(p.name for p in find_packages(root)) == ["Acme.Client", "Duende.IdentityServer"]
+
+
+def test_the_walk_skips_dependencies_and_build_output(tmp_path):
+    from docrot.acquire.repo import find_packages
+    root = tmp_path / "r"
+    _write(root, "package.json", '{"name": "real"}')
+    for skipped in ("node_modules/dep", "vendor/dep", "third_party/dep", ".venv/dep", "dist/dep",
+                    "build/dep", "target/dep"):
+        _write(root, f"{skipped}/package.json", '{"name": "bad"}')
+        _write(root, f"{skipped}/pyproject.toml", '[project]\nname = "bad"\n')
+    assert [p.name for p in find_packages(root)] == ["real"]
+
+
+def test_the_walk_is_bounded_and_finds_the_shallow_packages_first(tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    root = tmp_path / "big"
+    _write(root, "pkg/package.json", '{"name": "near"}')
+    for i in range(40):
+        _write(root, f"deep/a{i}/b/c/package.json", f'{{"name": "far{i}"}}')
+    monkeypatch.setattr(repo, "MAX_WALK_DIRS", 8)
+    names = [p.name for p in repo.find_packages(root)]
+    assert "near" in names and len(names) < 41
+
+
+def test_find_package_compatibility_for_single_result_callers(tmp_path):
+    from docrot.acquire.repo import find_package
+    root = tmp_path / "mono"
+    _write(root, "frontend/package.json", '{"name": "@mono/frontend"}')
+    _write(root, "lib/pyproject.toml", '[project]\nname = "mono"\n')
+    _write(root, "lib/mono/__init__.py", "")
+    assert find_package(root)[:3] == ("mono", "mono", "pypi")                # python beats a frontend
+    assert find_package(tmp_path / "empty") == ("", "", "pypi", tmp_path / "empty")
+    deep = tmp_path / "deep"
+    _write(deep, "a/b/package.json", '{"name": "deep-pkg"}')                 # past the old one-level search
+    assert find_package(deep)[:3] == ("deep-pkg", "deep-pkg", "npm")
+
+
+def test_concurrent_clones_of_one_repo_never_overlap_but_different_repos_may(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import docrot.acquire.repo as repo
+    inside, peak, lock = {}, {}, threading.Lock()
+
+    def slow(url, log, timeout):
+        with lock:
+            inside[url] = inside.get(url, 0) + 1
+            peak[url] = max(peak.get(url, 0), inside[url])
+        time.sleep(0.05)
+        with lock:
+            inside[url] -= 1
+        return tmp_path, "sha", "main"
+
+    monkeypatch.setattr(repo, "_clone_remote", slow)
+    urls = ["https://x.io/a/one"] * 3 + ["https://x.io/a/two"]
+    threads = [threading.Thread(target=repo.clone, args=(u, print, 5)) for u in urls]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert peak == {"https://x.io/a/one": 1, "https://x.io/a/two": 1}
+
+
+def test_other_manifests_come_from_git_when_a_sparse_clone_has_none_on_disk(tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    from docrot.acquire.detect import other_manifests
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    origin = _repo(tmp_path, "alpha")
+    (origin / "Cargo.toml").write_text('[package]\nname = "alpha"\n')
+    (origin / "tools").mkdir()
+    (origin / "tools" / "go.mod").write_text("module x\n")
+    _git("init", "-q", "-b", "main", cwd=origin)
+    _git("add", ".", cwd=origin)
+    _git("commit", "-qm", "one", cwd=origin)
+    path, _, _ = repo.clone(f"file://{origin}", log=lambda *_: None)
+    assert not (path / "Cargo.toml").exists()
+    assert other_manifests(path) == ["Cargo.toml", "go.mod"]

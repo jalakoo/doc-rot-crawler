@@ -238,3 +238,61 @@ def test_packages_follow_their_repos_through_de_duplication(store):
     rec = store.create(["https://docs.a.io"], ["./a", " ./a ", "./b"], packages=["", "pa", "pb"])
     assert store.get(rec.id).repos == ["./a", "./b"]
     assert store.get(rec.id).packages == ["pa", "pb"]
+
+
+def test_package_prefixes_name_the_registry_and_are_normalised():
+    from docrot.store import split_package
+    assert clean_packages([" pypi:relate-db ", "npm: @relate/relate", "nuget:Relate.Net"]) == \
+        ["pypi:relate-db", "npm:@relate/relate", "nuget:Relate.Net"]
+    assert split_package("npm:@relate/relate") == ("npm", "@relate/relate")
+    # a scoped or dotted name with no prefix is still just a name
+    assert split_package("@relate/relate") == ("", "@relate/relate")
+    assert split_package("Relate.Net") == ("", "Relate.Net")
+    assert clean_packages(["@relate/relate", "Relate.Net"]) == ["@relate/relate", "Relate.Net"]
+
+
+def test_an_unknown_or_empty_prefix_is_rejected_with_every_problem_listed():
+    with pytest.raises(ValueError) as e:
+        clean_packages(["ok", "cargo:serde", "PyPI:foo", "npm:", "gem:rails"])
+    problems = e.value.args[0]
+    assert len(problems) == 4
+    assert "Package 2 (cargo:serde) has an unknown ecosystem prefix 'cargo:'" in problems[0]
+    assert "use pypi:, npm: or nuget:" in problems[0]
+    assert "PyPI:foo" in problems[1]            # only the lowercase spellings count
+    assert "Package 4" in problems[2] and "names no package" in problems[2]
+    assert "gem:rails" in problems[3]
+
+
+def test_prefixed_packages_stay_aligned_with_their_repos(store):
+    from docrot.store import align_packages
+    repos = ["./a", "./a", "./b"]
+    assert align_packages(repos, ["", "npm:pa", "pypi:pb", "nuget:loose"]) == \
+        ["npm:pa", "pypi:pb", "nuget:loose"]
+    rec = store.create(["https://docs.a.io"], ["./a", "./b"], packages=["", " nuget: Pb "])
+    assert store.get(rec.id).packages == ["", "nuget:Pb"]
+
+
+def test_a_bad_prefix_stops_a_scan_being_created_or_aligned(store):
+    from docrot.store import align_packages
+    with pytest.raises(ValueError, match="unknown ecosystem prefix"):
+        store.create(["https://docs.a.io"], ["./a"], packages=["cargo:x"])
+    with pytest.raises(ValueError):
+        align_packages(["./a"], ["rubygems:x"])
+    assert store.all() == []
+
+
+def test_auto_is_an_ecosystem_and_old_records_keep_theirs(store):
+    from pydantic import ValidationError
+
+    assert ScanOptions().ecosystem == "pypi"             # what a record written before `auto` means
+    assert ScanOptions(ecosystem="auto").ecosystem == "auto"
+    with pytest.raises(ValidationError):
+        ScanOptions(ecosystem="cargo")
+    rec = store.create(["https://docs.a.io"], [], packages=["momentic"],
+                       options=ScanOptions(ecosystem="npm"))
+    path = store.scans_dir / rec.id / "scan.json"
+    data = json.loads(path.read_text())
+    data["options"].pop("assume_credentialed")           # an older file, missing newer fields
+    path.write_text(json.dumps(data))
+    got = store.get(rec.id)
+    assert got.options.ecosystem == "npm" and got.packages == ["momentic"]

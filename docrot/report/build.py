@@ -12,7 +12,7 @@ import re
 from collections import Counter
 from urllib.parse import urlparse
 
-from ..models import Extraction, Finding, Page, Result, Target
+from ..models import REASONS, UNRECORDED, Extraction, Finding, Page, Result, Snippet, Target, coverage
 
 DRIFT_KINDS = ("stale_pin", "signature", "missing_symbol", "runtime")
 
@@ -590,10 +590,12 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
     npm = ex.ecosystem == "npm"
     if not checked:
         tiers = sorted({x.tier for x in snips})
+        why = _why_unchecked(snips)
         return Finding(
             kind="unverified", label="not verified",
             title="NOT VERIFIED — NOTHING RAN HERE",
-            desc=(f"None of the {len(snips)} snippet(s) on this page were checked against "
+            desc=(f"{why}. Recorded as unverified rather than counted as clean." if why else
+                  f"None of the {len(snips)} snippet(s) on this page were checked against "
                   f"<b>{ex.package}</b>: they are <b>{', '.join(tiers)}</b>, or the install they "
                   "needed failed. Recorded as unverified rather than counted as clean."),
             page=page.url, doc_where=f"{page.path} · {len(snips)} snippets",
@@ -633,6 +635,52 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
         chips=[["tier-struct", s.tier], ["st-pass", "no drift"], ["", "clean"]],
         sprite="none",
     )
+
+
+LANG_NAMES = {"c": "C", "cpp": "C++", "c++": "C++", "objc": "Objective-C", "php": "PHP",
+              "sql": "SQL", "js": "JavaScript", "ts": "TypeScript", "golang": "Go"}
+
+
+def _lang_name(lang: str) -> str:
+    return LANG_NAMES.get(lang, lang.capitalize() if lang else "unlabelled")
+
+
+def _why_unchecked(snips: list[Snippet]) -> str:
+    """The page's real reason, when every snippet on it shares one; else ''.
+
+    Not when a snippet was checked or failed to install: then the page is
+    unverified for reasons this cannot name from the snippets alone."""
+    if not snips or any(s.tier != "unverifiable" for s in snips):
+        return ""
+    reasons = {s.reason for s in snips}
+    if len(reasons) != 1 or "" in reasons:
+        return ""
+    reason, n = reasons.pop(), len(snips)
+    if reason == "no-checker":
+        langs = sorted({_lang_name(s.lang) for s in snips})
+        if len(langs) == 1:
+            return f"{n} {langs[0]} snippet{'s' if n != 1 else ''} - docrot has no {langs[0]} checker yet"
+        return f"{n} snippets in {', '.join(langs)} - docrot has no checker for those languages yet"
+    what = {
+        "not-code": "prose, config, data or diagrams - not code docrot can check",
+        "other-language": "in a language this scan has no package for",
+        "no-package-use": "use nothing from the scanned packages",
+        "fragment": "excerpts with nothing checkable in them",
+        "not-declared": "declare names the package does not define",
+    }.get(reason, REASONS.get(reason, UNRECORDED))
+    return f"{n} snippet{'s' if n != 1 else ''} on this page: {what}"
+
+
+def _coverage(ex: Extraction) -> dict:
+    """The report's `coverage` block: counts by tier, unverifiable by reason,
+    no-checker by language, and the same per page. `labels` is the human text
+    for each reason code."""
+    by_page: dict[str, list[Snippet]] = {}
+    for s in ex.snippets:
+        by_page.setdefault(s.page, []).append(s)
+    return {**coverage(ex.snippets),
+            "labels": {**REASONS, UNRECORDED: "reason not recorded"},
+            "pages": {url: coverage(snips) for url, snips in by_page.items()}}
 
 
 def _assemble(ex, by_page, results, targets, home, docs_urls, repo_urls,
@@ -695,6 +743,7 @@ def _assemble(ex, by_page, results, targets, home, docs_urls, repo_urls,
             "versions": sum(len(t.versions) for t in targets),
             "snippets": len(ex.snippets),
         },
+        "coverage": _coverage(ex),
         "versions": [v.model_dump() for v in primary.versions],
         "sections": [{"name": k, "pages": v} for k, v in sections.items()],
         "timeline": timeline,

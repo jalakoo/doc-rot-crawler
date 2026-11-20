@@ -39,8 +39,9 @@ docrot process, such as an agent's, is left alone). `--all-cache` also empties `
 costs the next scan a fresh clone and crawl.
 
 Add scans from the dashboard's **New scan** dialog, or from the CLI. A scan can
-pair several docs sites with several repos; every repo that declares a package is
-verified against its own releases.
+pair several docs sites with several repos, and a repo can hold several
+packages, in any mix of PyPI, npm and NuGet; each package is verified in its own
+lane against its own releases (see [Repos with several packages](#repos-with-several-packages)).
 
 ```bash
 docrot scan --docs-url https://docs.perseus.lettria.net \
@@ -52,6 +53,7 @@ docrot scan --name "Duende IdentityServer" --max-pages 1000 \
             --docs-url https://docs.duendesoftware.com \
             --repo https://github.com/DuendeSoftware/products \
             --package Duende.IdentityServer Duende.BFF   # .NET: see below
+docrot packages https://github.com/relatedb/relate   # what a repo holds, before scanning it
 docrot scans                  # what's recorded
 docrot diff [--scan ID]       # regressions since the previous run; exit 1 if any (cron)
 docrot blast close_async      # pages that break if a symbol is renamed
@@ -66,6 +68,81 @@ end-of-run sandbox sweep both assume a single scan.
 ![The six phases of a scan: acquire, registry, extract, verify, graph, report -
 from docs and repos in, to findings out as JSONL, SARIF, CI annotations and
 agent input](images/architecture-dungeon.png)
+
+### Repos with several packages
+
+A repo can publish more than one package, and in more than one ecosystem.
+[Relate's](https://github.com/relatedb/relate) holds `relate-db` on PyPI
+(`surfaces/relate-python`), `@relate/relate` on npm (`clients/javascript`) and
+`Relate.Net` on NuGet (`clients/dotnet`). Ask what a repo holds before scanning it:
+
+```bash
+docrot packages https://github.com/relatedb/relate
+#   npm:@relate/relate   @relate/relate   clients/javascript
+#   pypi:relate-db       relate            surfaces/relate-python/python
+#   nuget:Relate.Net     Relate.Net        clients/dotnet/src/Relate.Net
+```
+
+Then scan it. Every package becomes its own target, verified in its own lane
+(pip, npm or .NET sandboxes) against its own registry releases, and each code
+snippet is checked against the package it imports:
+
+```bash
+docrot scan --name Relate --docs-url https://relatedb.ai/docs/ \
+            --repo https://github.com/relatedb/relate
+```
+
+**Which packages a repo contributes.**
+
+- **Named.** `--package` entries (or the dashboard's package field) that match a
+  package in a repo restrict that repo to exactly those. Matching ignores case
+  and `-`/`_`/`.`, and `relate` means `@relate/relate` the way `wizard` means
+  `@momentic/wizard`. The first name goes with the first `--repo`, but a name is
+  matched against every repo, so `--package nuget:Relate.Net pypi:relate-db`
+  works whichever order the repos are in. Named packages are never capped.
+- **Automatic.** With nothing named for a repo, docrot verifies every package
+  the docs actually talk about. A package scores by how often the docs corpus
+  names its distribution name (where that is not also an English word), puts it
+  in an install command (`pip install`, `npm install`, `dotnet add package`...)
+  or imports it (`import`/`from`, `from "pkg"`/`require("pkg")`, `using
+  Namespace;`). A bare `relate` in prose counts for nothing. Packages with a
+  score are kept, most mentioned first, at most **6 per repo** (a .NET monorepo of 28
+  packages must not launch 28 sandboxes per version); the scan log says which it
+  chose and which it skipped (`skipped 3 the docs never mention: ...; name them
+  to include them`). A repo-only scan has no docs site, so the repo's own docs
+  are scored. A package that is the primary pick (see below) goes first
+  whatever its score.
+- **Nothing mentioned, or only one package.** The single best package, picked as
+  it always was, so a Streamlit, Pydantic or Perseus scan is unchanged.
+- **A name the repo does not have** is verified from its registry. Written
+  beside that repo (same position) it keeps the repo as its source link, as for
+  a docs-only repo (`--repo momentic-ai/cli --package momentic`); a name past the
+  last repo has no source at all.
+- **One name on two registries** (say `relate-db` on PyPI and on npm) is verified
+  once: results, snippets and the graph are keyed by package name alone, so the
+  first one wins and the scan logs `! relate-db is on pypi and npm; only the pypi
+  one is verified and the npm one is skipped`.
+
+The first package verified is the primary, the one a snippet that names no
+package is attributed to. A repo with no PyPI, npm or NuGet package says what it
+looked for and what it saw (`no PyPI, npm or NuGet package found in relate; it
+does contain Cargo.toml, go.mod - docrot has no lane for those yet`).
+
+**Ecosystem per package.** Each package gets its ecosystem from its manifest. For
+a name no repo describes, give the registry as a prefix on the entry: `pypi:relate-db`,
+`npm:@relate/relate`, `nuget:Relate.Net` (only these three lowercase prefixes;
+anything else is rejected). Without a prefix, `--ecosystem` decides:
+
+- `auto` (the CLI default) asks PyPI, npm and NuGet and uses the one that has the
+  name. If several do, the scan stops and shows the prefixes to choose between;
+  if none does, it stops too.
+- `pypi`, `npm` or `nuget` is the registry for every unprefixed name, as before.
+  Scans recorded earlier keep the ecosystem they stored.
+
+```bash
+docrot scan --docs-url https://relatedb.ai/docs/ \
+            --package pypi:relate-db npm:@relate/relate   # a registry-only scan, no repo
+```
 
 ### .NET documentation
 
@@ -91,8 +168,11 @@ release** is rot. **Requires a newer release** means the page is right for the
 current release but not for older ones.
 
 A .NET monorepo ships many packages. `--package` names the ones to verify,
-several for one `--repo`. Without it, the scan picks the package the docs
-mention most. NuGet versions are picked across major lines (8.0.8, 7.4.12,
+several for one `--repo`. Without it, the scan verifies the packages the docs
+mention, most mentioned first, at most 6 per repo; a `using` line counts for the
+package with the longest matching root namespace, so
+`Duende.IdentityServer.EntityFramework` is not credited to
+`Duende.IdentityServer`. NuGet versions are picked across major lines (8.0.8, 7.4.12,
 7.3.4) rather than as three patches of one minor, because drift can only be
 seen against a version old enough to compile the stale code.
 
@@ -125,12 +205,12 @@ every few days, and neighbours agree on nearly everything.
 
 A package whose repo holds only docs has no `package.json` to read. Name the
 package, in the dashboard's package field beside the repo or with `--package`,
-and choose npm as the ecosystem:
+and say it is npm with the `npm:` prefix or `--ecosystem npm`:
 
 ```bash
 docrot scan --name "Momentic" --docs-url https://momentic.ai/docs \
             --repo https://github.com/momentic-ai/cli \
-            --package momentic --ecosystem npm --versions 2
+            --package npm:momentic --versions 2
 ```
 
 The sandbox image can be changed with `DOCROT_NODE_IMAGE` (Node 20 or newer).

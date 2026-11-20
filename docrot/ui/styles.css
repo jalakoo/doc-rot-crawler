@@ -223,6 +223,27 @@
   .strip b{color:var(--torch);font-weight:400;font-variant-numeric:tabular-nums}
   .strip .ok{color:var(--moss)}
 
+  /* ---------- coverage: what was checked, and why the rest was not ---------- */
+  .cov-sum{margin:0 0 8px;font-size:18px;color:var(--bone-dim);display:flex;flex-wrap:wrap;gap:2px 14px}
+  .cov-sum span{white-space:nowrap}
+  .cov-sum b{color:var(--torch);font-weight:400;font-variant-numeric:tabular-nums}
+  .cov-bar{display:flex;height:10px;gap:2px;margin:0 0 9px;background:#0a0710}
+  .cov-bar i{display:block;min-width:3px;background:var(--stone-edge)}
+  .cov-bar i.ok{background:var(--moss)}
+  .cov-bar i.r1{background:var(--gate)}
+  .cov-bar i.r2{background:var(--rune)}
+  .cov-bar i.r3{background:var(--bone-faint)}
+  .cov-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:3px}
+  .cov-list li{display:flex;align-items:baseline;gap:8px;font-size:17px;color:var(--bone-dim);min-width:0}
+  .cov-list i{flex:none;width:9px;height:9px;align-self:center;background:var(--stone-edge)}
+  .cov-list li.ok i{background:var(--moss)}
+  .cov-list li.r1 i{background:var(--gate)}
+  .cov-list li.r2 i{background:var(--rune)}
+  .cov-list li.r3 i{background:var(--bone-faint)}
+  .cov-list b{flex:none;min-width:34px;text-align:right;color:var(--bone);font-weight:400;font-variant-numeric:tabular-nums}
+  .cov-list .why{min-width:0;overflow-wrap:anywhere}
+  .cov-list small{display:block;font-size:15px;color:var(--bone-dim)}
+
   /* ---------- site map ---------- */
   .sect{margin:0 0 11px}
   .sect:last-child{margin:0}
@@ -566,10 +587,11 @@
   .pkg-rows{margin-top:10px}
   .pkg-rows:empty{display:none}
   .src-tag.pkg{color:var(--bone-dim)}
+  .src-row.repo-row{flex-wrap:wrap}
   @media (max-width:520px){
-    .src-row.repo-row{flex-wrap:wrap}
     .src-row.repo-row .inp{flex:1 1 calc(100% - 100px)}
     .src-row.repo-row .inp.pkg{flex:1 1 100%;order:3}
+    .src-row.repo-row .found{order:4}
   }
   .rm{
     flex:none;width:34px;height:36px;padding:0;cursor:pointer;
@@ -587,6 +609,26 @@
   .field.docs .add-row:hover{color:var(--rune);border-color:var(--rune)}
   .field.code .add-row:hover{color:var(--torch);border-color:var(--torch)}
   .add-row:focus-visible{outline:3px solid var(--torch);outline-offset:1px}
+  .row-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .row-actions .add-row{flex:1 1 160px;width:auto}
+  .add-row.detect{text-align:center;color:var(--torch);border-style:solid}
+  .field.code .add-row.detect:hover{background:var(--torch);color:var(--shadow)}
+  .add-row:disabled{opacity:.5;cursor:default}
+  .detect-status{margin:6px 0 0;font-size:17px;color:var(--bone-dim)}
+  .detect-status:empty{display:none}
+  .detect-status.busy::after{content:"\2588";margin-left:4px;color:var(--torch);animation:blink 1s steps(2) infinite}
+  @media (prefers-reduced-motion:reduce){.detect-status.busy::after{animation:none}}
+  /* what Detect found, under its repo row */
+  .found{flex:1 0 100%;margin:0 0 6px;padding:7px 10px;background:#0a0710;border-left:3px solid var(--torch);min-width:0}
+  .found.err{border-left-color:var(--blood)}
+  .found-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:3px}
+  .found-list label{display:flex;align-items:baseline;gap:8px;font-size:18px;cursor:pointer;min-width:0;flex-wrap:wrap}
+  .found-list input{accent-color:var(--torch);width:16px;height:16px;margin:0;flex:none;align-self:center}
+  .found-list b{font-weight:400;color:var(--bone);overflow-wrap:anywhere}
+  .found-list .pkg-meta{color:var(--bone-faint);font-size:16px;overflow-wrap:anywhere}
+  .found-note{margin:4px 0 0;font-size:16px;color:var(--bone-dim)}
+  .found-err{margin:0;font-size:17px;color:var(--blood-soft)}
+  .notice .btn-ghost{margin-top:10px}
   .hint{margin:6px 0 0;font-size:16px;color:var(--bone-faint)}
   .hint b{color:var(--bone-dim);font-weight:400}
   .opts{border-top:2px solid var(--stone-mid);padding-top:12px}

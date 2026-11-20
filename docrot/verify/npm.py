@@ -171,6 +171,17 @@ function cjsNamespace(m) {
   return ns;
 }
 
+// A release that ships no entry point at all (a name reserved on the registry
+// before the first real release) fails every import the same way, whatever
+// the docs say, so it says nothing about them.
+function shipsEntry() {
+  const root = path.join(here, 'node_modules', ...payload.package.split('/'));
+  let meta = {};
+  try { meta = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); } catch (e) { return true; }
+  if (meta.main || meta.exports || meta.module || meta.browser || meta.types || meta.typings) return true;
+  return ['index.js', 'index.cjs', 'index.mjs', 'index.json', 'index.node'].some((f) => fs.existsSync(path.join(root, f)));
+}
+
 async function loadOnce(spec) {
   if (spec.endsWith('.json')) {
     // import() wants an attribute for JSON; docs say require('pkg/package.json')
@@ -192,6 +203,9 @@ async function loadOnce(spec) {
       // import() is stricter than require(); docs written for CJS are not wrong.
       try { return { state: 'ok', ns: cjsNamespace(req(spec)), via: 'require' }; }
       catch (e) { return { state: 'error', message: describe(e) }; }
+    }
+    if (spec === payload.package && !shipsEntry()) {
+      return { state: 'placeholder', message: spec + ' ships no entry point in this release; imports from it not judged' };
     }
     return { state: err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED' ? 'not_exported' : 'missing',
              message: describe(err) };
@@ -418,6 +432,12 @@ def resolve_bin(inv: Invocation, package: str, bins: dict[str, str]) -> CliCheck
         # npm exec / npx run the only bin whatever it is called
         if len(bins) == 1:
             return CliCheck(inv, next(iter(bins)))
+        if not bins and inv.package != package:
+            # `relate query ...` typed bare: with no bin anywhere in the package this is
+            # a program installed some other way (Relate's CLI is a Rust binary), not
+            # a bin the package forgot. Only `npx pkg` claims the package ships one.
+            return CliCheck(inv, "", f"`{inv.bin}` is run as a bare command and {package} installs "
+                                     "no bin at all; probably a separate program, not judged")
         return CliCheck(inv, "", "installs no bin of that name")
     if inv.package == package:
         return CliCheck(inv, "", f"`{inv.bin}` is not a bin of {package}; not judged")

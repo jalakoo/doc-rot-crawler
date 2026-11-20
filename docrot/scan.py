@@ -4,23 +4,39 @@
 status, phase and log as the scan runs and saves the finished run - and is the
 one code path behind both `docrot scan` and the dashboard's queue.
 
-A scan may span several docs sites and several repos. Every repo that declares
-a package becomes a verification target with its own releases; snippets are
-attributed to the package they exercise (see `extract.pipeline.attribute`).
+A scan may span several docs sites and several repos, and a repo may hold
+several packages in several ecosystems. Each package the scan names, or that the
+docs mention (`mention_scores`), becomes a verification target with its own
+ecosystem and releases; snippets are attributed to the package they exercise
+(see `extract.pipeline.attribute`).
 """
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from . import config as cfgmod
 from .models import Extraction, Release, Result, Target
-from .store import PHASES, ScanOptions, ScanRecord, ScanStatus, Store, now
+from .store import (
+    ECOSYSTEMS,
+    PHASES,
+    ScanOptions,
+    ScanRecord,
+    ScanStatus,
+    Store,
+    now,
+    split_package,
+)
+
+if TYPE_CHECKING:
+    from .acquire.repo import Package
 
 # Ecosystems whose versions are picked across major/minor lines, not just the
 # newest few. NuGet needs it to find a release old enough to still compile the
@@ -30,6 +46,12 @@ from .store import PHASES, ScanOptions, ScanRecord, ScanStatus, Store, now
 # removed commands and exports actually show. PyPI keeps the plain newest-N:
 # its docs usually track the current minor.
 SPREAD_ECOSYSTEMS = frozenset({"nuget", "npm"})
+
+# Most packages one repo contributes when the scan names none of them. A .NET
+# monorepo ships 28 (Duende's); every package is a sandbox per version tested,
+# so the docs' own mentions choose and this bounds the worst case. Packages the
+# scan names are never capped.
+MAX_AUTO_PACKAGES = 6
 
 Log = Callable[[str], None]
 
@@ -100,6 +122,224 @@ def _short(url: str) -> str:
     return (p.netloc + p.path).rstrip("/") if p.netloc else url
 
 
+# ------------------------------------------------- which packages a repo gives
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _answers_to(pkg: Package, eco: str, name: str) -> bool:
+    """Does the packages entry `eco:name` mean `pkg`? Case and `-`/`_`/`.` do
+    not matter, and `wizard` means `@momentic/wizard`: the unscoped tail counts."""
+    if eco and eco != pkg.ecosystem:
+        return False
+    return name.lower() in (pkg.name.lower(), pkg.name.rsplit("/", 1)[-1].lower()) \
+        or _norm(name) == _norm(pkg.name)
+
+
+def _key(p: Package) -> str:
+    return f"{p.ecosystem}:{p.name}"
+
+
+def _mentioned_alone(p: Package) -> bool:
+    """May a bare mention of `p`'s name count, outside an install or import?
+
+    Only a name that prose and other registries do not also use. `relate-db` on
+    PyPI and `@relate/relate` on npm are never English; a bare `relate` or
+    `streamlit` is, so those have to turn up in an install command or an import
+    first. An unscoped npm name is not safe either - `pydantic-core` is a PyPI
+    project's name all over its docs - but a scoped one, or a NuGet id, is."""
+    if p.ecosystem == "npm":
+        return p.name.startswith("@")
+    if p.ecosystem == "nuget":
+        return "." in p.name
+    return bool(re.search(r"[-_.\d]", p.name))
+
+
+def _name_re(p: Package) -> re.Pattern:
+    """The name as docs spell it: PyPI treats `-`, `_` and `.` alike; npm and
+    NuGet names are literal (NuGet ignoring case), so `pydantic_core` is not
+    npm's `pydantic-core`. `Duende.IdentityServer` must not match inside
+    `Duende.IdentityServer.EntityFramework`."""
+    if p.ecosystem == "pypi":
+        body = r"[-_.]".join(re.escape(x) for x in re.split(r"[-_.]+", p.name))
+    else:
+        body = re.escape(p.name)
+    return re.compile(rf"(?<![\w@./-]){body}(?![\w-]|\.\w)", re.I)
+
+
+# Each ecosystem's install commands: a name on such a line is named as *that
+# ecosystem's* package.
+_INSTALL = {
+    "pypi": re.compile(r"\b(?:pip3?\s+install|-m\s+pip\s+install|uv\s+(?:pip\s+install|add|tool\s+install)|"
+                       r"poetry\s+add|pdm\s+add|pipx\s+install|conda\s+install)\b", re.I),
+    "npm": re.compile(r"\b(?:npm\s+(?:i|install|add)|npx|yarn\s+(?:global\s+)?add|"
+                      r"pnpm\s+(?:i|add|install|dlx)|bun\s+(?:add|install)|bunx)\b", re.I),
+    "nuget": re.compile(r"\b(?:dotnet\s+add\s+(?:\S+\s+)?package|dotnet\s+tool\s+install|"
+                        r"install-package|nuget\s+install|packagereference)\b", re.I),
+}
+_USING = re.compile(r"^[ \t]*(?:global[ \t]+)?using[ \t]+(?:static[ \t]+)?([A-Za-z_][\w.]*)[ \t]*;",
+                    re.M)
+
+
+def _import_re(pkg: Package) -> re.Pattern | None:
+    """How code in the docs reaches `pkg`: a Python `import`/`from` line, a
+    JS `from`/`require`/`import()` of the module or one of its subpaths. NuGet
+    is counted separately, by namespace."""
+    imp = re.escape(pkg.import_name)
+    if pkg.ecosystem == "pypi":
+        return re.compile(rf"(?:^|[`;>])[ \t]*(?:import|from)[ \t]+{imp}(?:\.\w+)*"
+                          r"(?:[ \t]+(?:import|as)\b|[ \t]*,|[ \t]*(?:$|`))", re.M)
+    if pkg.ecosystem == "npm":
+        return re.compile(rf"(?:\bfrom|\brequire\(|\bimport\(|\bimport)\s*['\"`]{imp}"
+                          r"(?:/[^'\"`\s]*)?['\"`]")
+    return None
+
+
+def _namespace_hits(found: list[Package], corpus: str) -> dict[str, int]:
+    """`using` directives per NuGet package. The longest root namespace wins:
+    `using Duende.IdentityServer.EntityFramework.Stores;` belongs to the
+    EntityFramework package, not also to the IdentityServer one it sits under."""
+    roots = [p for p in found if p.ecosystem == "nuget"]
+    hits: dict[str, int] = {}
+    if not roots:
+        return hits
+    for ns in _USING.findall(corpus):
+        low = ns.lower()
+        owners = [p for p in roots
+                  if low == p.import_name.lower() or low.startswith(p.import_name.lower() + ".")]
+        if owners:
+            best = max(owners, key=lambda p: len(p.import_name))
+            hits[best.name] = hits.get(best.name, 0) + 1   # nuget ids are unique
+    return hits
+
+
+def mention_scores(found: list[Package], corpus: str) -> dict[str, int]:
+    """How much the docs talk about each package, by `eco:name`.
+
+    Counts, per package: its distribution name where that is distinctive, the
+    install commands that name it (the only place a bare name like `streamlit`
+    counts as a name), and the import/require/using lines that reach it. A bare
+    `relate` in prose is nothing: Relate's docs say it on every page, and it
+    cannot tell the Python client from the .NET one.
+    """
+    lines = corpus.splitlines()
+    installs = {eco: "\n".join(x for x in lines if rx.search(x)) for eco, rx in _INSTALL.items()}
+    ns = _namespace_hits(found, corpus)
+    out: dict[str, int] = {}
+    for p in found:
+        text = corpus if _mentioned_alone(p) else installs.get(p.ecosystem, "")
+        score = len(_name_re(p).findall(text))
+        imp = _import_re(p)
+        if imp:
+            score += len(imp.findall(corpus))
+        out[_key(p)] = score + (ns.get(p.name, 0) if p.ecosystem == "nuget" else 0)
+    return out
+
+
+@dataclass
+class Choice:
+    chosen: list[Package]
+    unmentioned: list[Package]
+    over_cap: list[Package]
+
+
+def choose_packages(found: list[Package], scores: dict[str, int],
+                    first: Package | None = None, cap: int | None = None) -> Choice:
+    """The packages with evidence, best first, at most `cap`. `first`, the
+    package a single-package scan has always picked, leads when it is among
+    them, so a repo that was verified as one package keeps its primary."""
+    cap = MAX_AUTO_PACKAGES if cap is None else cap
+    hit = [p for p in found if scores.get(_key(p))]
+    if first is not None:
+        lead = next((p for p in hit if (p.ecosystem, _norm(p.name)) == (first.ecosystem, _norm(first.name))), None)
+        if lead:
+            hit = [lead] + [p for p in hit if p is not lead]
+    return Choice(hit[:cap], [p for p in found if not scores.get(_key(p))], hit[cap:])
+
+
+def nothing_found(path: Path, name: str) -> str:
+    """What was looked for and what was seen, for a repo that yields no package."""
+    msg = f"no PyPI, npm or NuGet package found in {name}"
+    from .acquire.detect import other_manifests
+    seen = other_manifests(path)
+    if seen:
+        msg += f"; it does contain {', '.join(seen)} - docrot has no lane for those yet"
+    return msg
+
+
+def _to_check(snips: list) -> str:
+    """How many of a package's snippets a lane will actually look at. Unverifiable
+    ones are attributed to it too, but no sandbox ever sees them."""
+    n = sum(1 for s in snips if s.tier != "unverifiable")
+    return f"{n} snippets to check ({len(snips) - n} more attributed to it, not checkable)"
+
+
+def _listed(pkgs: list[Package], limit: int = 8) -> str:
+    names = [_key(p) for p in pkgs]
+    return ", ".join(names[:limit]) + (f", and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _automatic(path: Path, name: str, corpus: str, found: list[Package],
+               scores: dict[str, int], log: Log) -> list[Package]:
+    """The packages to verify from a repo the scan names nothing in.
+
+    One package, or none, is what a scan has always done: whatever `find_package`
+    picks. Several: every one the docs mention (`mention_scores`), at most
+    `MAX_AUTO_PACKAGES`, the legacy pick first when it is among them. When the
+    docs mention none, the legacy pick alone - a scan of Streamlit, whose repo
+    holds two npm component libraries too, verifies what it always did."""
+    from .acquire import repo as repomod
+    from .acquire.repo import Package
+    dist, imp, eco, root = repomod.find_package(path, hint=name, rank=corpus.count)
+    legacy = Package(dist, imp, eco, root) if dist else None
+    if len(found) <= 1:
+        return [legacy] if legacy else []
+    pick = choose_packages(found, scores, first=legacy)
+    if not pick.chosen:
+        best = legacy or found[0]
+        log(f"  {name} holds {len(found)} packages ({_listed(found)}) and the docs mention "
+            f"none of them - verifying {_key(best)} only; name others to include them")
+        return [best]
+    log(f"  {name} holds {len(found)} packages - verifying the {len(pick.chosen)} the docs "
+        f"mention: {_listed(pick.chosen)}")
+    if pick.unmentioned:
+        log(f"  skipped {len(pick.unmentioned)} the docs never mention: "
+            f"{_listed(pick.unmentioned)}; name them to include them")
+    if pick.over_cap:
+        log(f"  skipped {len(pick.over_cap)} past the cap of {MAX_AUTO_PACKAGES} per repo: "
+            f"{_listed(pick.over_cap)}; name them to include them")
+    return pick.chosen
+
+
+def pick_ecosystem(name: str, prefix: str, default: str,
+                   on: Callable[[str, str], bool], linked: bool = False) -> str:
+    """The registry a package that no repo describes is on.
+
+    A prefix (`npm:name`) decides. Otherwise the scan's ecosystem does, unless
+    it is `auto`: then the registries are asked. One that has the name wins;
+    several is an error naming them, none is an error unless the package is
+    linked to a repo, which can be installed from source (the docs-only-repo and
+    not-yet-published cases) and is treated as PyPI like before."""
+    if prefix:
+        return prefix
+    if default != "auto":
+        return default
+    if name.startswith("@"):                  # only npm has scopes
+        return "npm"
+    hits = [e for e in ECOSYSTEMS if on(name, e)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        syntax = " or ".join(f"{e}:{name}" for e in hits)
+        raise ScanError(f"{name} exists on {' and '.join(hits)} - say which one: "
+                        f"--package {syntax} (the package field takes the same form)")
+    if linked:
+        return "pypi"
+    raise ScanError(f"no package to verify - {name} was not found on PyPI, npm or NuGet. "
+                    f"Check the spelling, name its registry ({' / '.join(e + ':' + name for e in ECOSYSTEMS)}) "
+                    "or add the repo it lives in")
+
+
 async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
                    phase: Callable[[int], None] = lambda i: None) -> ScanOutcome:
     from .acquire import acquire_repo, acquire_site, pick_versions, releases
@@ -109,8 +349,7 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         clone,
         dotnet_surface,
         ensure_sources,
-        find_package,
-        nuget_packages,
+        find_packages,
         repo_name,
         symbols_at_head,
     )
@@ -147,78 +386,116 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
     targets: list[Target] = []
     head: dict[str, set[str]] = {}
     api: dict[str, Surface] = {}               # .NET packages' public API at HEAD
-    clones: list[tuple[str, Path, str, str]] = []
-    corpus = "\n".join(p.text for p in pages)
+    prefetched: dict[tuple[str, str], list[Release]] = {}
+    site_text = "\n".join(p.text for p in pages)
     multi = len(inp.repos) > 1
-    for i, repo in enumerate(inp.repos):
+    entries = [split_package(p) for p in inp.packages]       # (ecosystem or "", name)
+
+    def known(name: str, eco: str) -> bool:
+        if (eco, name) not in prefetched:
+            prefetched[(eco, name)] = releases(name, eco)
+        return bool(prefetched[(eco, name)])
+
+    async def ecosystem_of(name: str, prefix: str, linked: bool) -> str:
+        return await asyncio.to_thread(pick_ecosystem, name, prefix, opts.ecosystem, known, linked)
+
+    def add(t: Target, syms: set[str], surface: Surface | None, where: str = "") -> None:
+        again = next((x for x in targets if _norm(x.package) == _norm(t.package)), None)
+        if again:
+            if again.ecosystem == t.ecosystem:
+                head[again.package] |= syms
+            else:
+                # results, snippets and the graph are all keyed by package name
+                log(f"  ! {t.package} is on {again.ecosystem} and {t.ecosystem}; only the "
+                    f"{again.ecosystem} one is verified and the {t.ecosystem} one is skipped "
+                    "(a scan keys its results by package name alone)")
+            return
+        targets.append(t)
+        head[t.package] = syms
+        if surface:
+            api[t.package] = surface
+        log(f"  {t.package} ({t.ecosystem}) · import {t.import_name} · "
+            f"{len(syms)} public symbols at HEAD ({t.commit}){where}")
+
+    # ---- acquire every repo and see what each holds
+    plans = []
+    claimed: set[int] = set()                  # packages entries some repo answered
+    for repo in inp.repos:
         try:
             path, commit, branch = await asyncio.to_thread(clone, repo, log, cfg.clone_timeout)
         except CloneError as e:
             raise ScanError(f"couldn't fetch {repo}: {e}") from e
-        clones.append((repo, path, commit, branch))
-        want = inp.packages[i] if i < len(inp.packages) else ""
-        # A .NET monorepo ships many packages; without --package, verify the
-        # one the docs talk about most.
-        dist, imp, eco, code_root = find_package(path, hint=repo_name(repo), want=want,
-                                                 rank=corpus.count)
-        if eco == "nuget" and not want:
-            others = [p.id for p in nuget_packages(path) if p.id != dist]
-            if others:
-                log(f"  {repo_name(repo)} ships {len(others) + 1} NuGet packages - verifying "
-                    f"{dist}; name others with --package")
-        if want and not dist:
-            # No metadata to say what the repo is, so the user's word and the
-            # chosen ecosystem do; find_package's "pypi" is only its default.
-            eco = opts.ecosystem
-        dist = want or dist
-        pages.extend(acquire_repo(path, log, namespace=repo_name(repo) if multi else "",
-                                  origin=repo))
-        where = f" · {repo_name(repo)}" if multi else ""
-        if not dist:
-            log(f"  ! no package metadata in {repo_name(repo)} - its docs are read, "
-                "nothing is verified from it; name its package (the package field, or "
-                "--package) to check the docs against it")
-            continue
-        imp = _import_name(dist, eco, imp)
-        if eco == "npm":
+        name = repo_name(repo)
+        repo_pages = acquire_repo(path, log, namespace=name if multi else "", origin=repo)
+        pages.extend(repo_pages)
+        # What the docs say decides which packages matter. A repo-only scan has
+        # no site, so the repo's own docs stand in.
+        corpus = site_text or "\n".join(p.text for p in repo_pages)
+        found = await asyncio.to_thread(find_packages, path, name)
+        scores: dict[str, int] = {}
+        if len(found) > 1:
+            # ranked by the docs' own mentions: ties and the order of what is
+            # chosen come from `find_packages`, which takes the score by name
+            scores = mention_scores(found, corpus)
+            by_name = {p.name: scores[_key(p)] for p in found}
+            found = await asyncio.to_thread(find_packages, path, name,
+                                            lambda n, m=by_name: m.get(n, 0))
+        here = [(j, p) for p in found for j, (eco, want) in enumerate(entries)
+                if want and _answers_to(p, eco, want)]
+        claimed |= {j for j, _ in here}
+        # in the order they were named: the first is the primary, as for
+        # `--package Duende.IdentityServer Duende.BFF`
+        named = list(dict.fromkeys(p for _, p in sorted(here, key=lambda x: x[0])))
+        plans.append((repo, path, commit, branch, corpus, found, scores, named))
+
+    # ---- turn each repo into targets
+    for i, (repo, path, commit, branch, corpus, found, scores, named) in enumerate(plans):
+        name = repo_name(repo)
+        where = f" · {name}" if multi else ""
+        pos = entries[i] if i < len(entries) and entries[i][1] else None
+        unmatched = pos if pos and i not in claimed else None
+        chosen = named
+        if not chosen and not unmatched:
+            chosen = _automatic(path, name, corpus, found, scores, log)
+        if any(p.ecosystem == "npm" for p in chosen):
             # a cached sparse clone holds only docs until the JS/TS sources are fetched
-            await asyncio.to_thread(ensure_sources, path, eco, log, cfg.clone_timeout)
-        syms = symbols_at_head(code_root, imp, eco)
-        if eco == "nuget":
-            api[dist] = Surface.of(dotnet_surface(code_root))
-        log(f"  {len(syms)} public symbols at HEAD ({commit}){where}")
-        known = next((t for t in targets if t.package == dist), None)
-        if known:
-            head[dist] |= syms
-            continue
-        targets.append(Target(package=dist, import_name=imp, ecosystem=eco,
-                              repo_url=repo, branch=branch, commit=commit,
-                              install_spec=(_source_spec(repo, commit, path, code_root)
-                                            if eco == "pypi" else "")))
-        head[dist] = syms
-    for name in inp.packages[len(inp.repos):]:
-        if not name or any(t.package == name for t in targets):
-            continue
-        # A further package from a .NET monorepo already cloned keeps its
-        # source at HEAD: `--repo products --package Duende.IdentityServer
-        # Duende.BFF` verifies both.
-        home = next(((r, p, c, b, pkg) for r, p, c, b in clones for pkg in nuget_packages(p)
-                     if pkg.id.lower() == name.lower()), None)
-        if home:
-            repo, _, commit, branch, pkg = home
-            code_root = pkg.project.parent
-            head[name] = symbols_at_head(code_root, pkg.namespace, "nuget")
-            api[name] = Surface.of(dotnet_surface(code_root))
-            targets.append(Target(package=name, import_name=pkg.namespace, ecosystem="nuget",
-                                  repo_url=repo, branch=branch, commit=commit))
-            log(f"  {len(head[name])} public symbols at HEAD ({commit}) · {name}")
-        else:
-            targets.append(Target(package=name, import_name=_import_name(name, opts.ecosystem),
-                                  ecosystem=opts.ecosystem))
+            await asyncio.to_thread(ensure_sources, path, "npm", log, cfg.clone_timeout)
+        for pkg in chosen:
+            imp = _import_name(pkg.name, pkg.ecosystem, pkg.import_name)
+            syms = symbols_at_head(pkg.root, imp, pkg.ecosystem)
+            add(Target(package=pkg.name, import_name=imp, ecosystem=pkg.ecosystem,
+                       repo_url=repo, branch=branch, commit=commit,
+                       install_spec=(_source_spec(repo, commit, path, pkg.root)
+                                     if pkg.ecosystem == "pypi" else "")),
+                syms, Surface.of(dotnet_surface(pkg.root)) if pkg.ecosystem == "nuget" else None,
+                where)
+        if unmatched:
+            # The user's word for what this repo is. A docs-only repo has no
+            # metadata to say, so the prefix or the scan's ecosystem does.
+            eco = await ecosystem_of(unmatched[1], unmatched[0], linked=True)
+            if eco == "npm":
+                await asyncio.to_thread(ensure_sources, path, eco, log, cfg.clone_timeout)
+            imp = _import_name(unmatched[1], eco)
+            add(Target(package=unmatched[1], import_name=imp, ecosystem=eco, repo_url=repo,
+                       branch=branch, commit=commit,
+                       install_spec=_source_spec(repo, commit, path, path) if eco == "pypi" else ""),
+                symbols_at_head(path, imp, eco), None, where)
+        elif not chosen:
+            log(f"  ! {nothing_found(path, name)}. Its docs are read, nothing is verified "
+                "from it; name its package (the package field, or --package) to check the "
+                "docs against it")
+    # an entry no repo answered is a package straight from its registry
+    for j, (eco, want) in enumerate(entries):
+        if want and j not in claimed and j >= len(inp.repos):
+            eco = await ecosystem_of(want, eco, linked=False)
+            add(Target(package=want, import_name=_import_name(want, eco), ecosystem=eco),
+                set(), None)
 
     if not targets:
-        raise ScanError("no package to verify - name one (the package field beside a repo, "
-                        "or --package on the command line) or use a repo that has package metadata")
+        looked = "; ".join(nothing_found(path, repo_name(repo)) for repo, path, *_ in plans)
+        raise ScanError("no package to verify - " + (looked + ". " if looked else "") +
+                        "Name one (the package field beside a repo, or --package on the "
+                        "command line) or use a repo that has package metadata")
     if not pages:
         raise ScanError("no pages acquired")
 
@@ -257,12 +534,12 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
             continue
         if t.ecosystem == "nuget":
             if len(targets) > 1:
-                log(f"  {t.package}: {len(snips)} snippets")
+                log(f"  {t.package}: {_to_check(snips)}")
             got = await run_dotnet_matrix(snips, t.package, t.package, t.labels, cfg, log,
                                           head=api.get(t.package))
         elif t.ecosystem == "npm":
             if len(targets) > 1:
-                log(f"  {t.package}: {len(snips)} snippets")
+                log(f"  {t.package}: {_to_check(snips)}")
             got = await run_npm_matrix(snips, t.package, t.labels, cfg, log)
         elif t.ecosystem != "pypi":
             log(f"  ! {t.package}: no verification lane for {t.ecosystem} packages yet - "
@@ -271,7 +548,7 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
                           tier=s.tier) for s in snips for v in t.labels]
         else:
             if len(targets) > 1:
-                log(f"  {t.package}: {len(snips)} snippets")
+                log(f"  {t.package}: {_to_check(snips)}")
             got = await run_matrix(snips, t.package, t.import_name, t.labels, cfg, log,
                                    install_spec=t.install_spec)
         for r in got:

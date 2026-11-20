@@ -69,6 +69,69 @@ test("alignPackages keeps positions and appends repo-less packages", () => {
   assert.deepEqual(L.alignPackages(["", ""], ["", ""], ["p", "p", " q "]), ["p", "q"]);
 });
 
+test("alignPackages puts a repo's first ticked package in its slot and the rest in the tail", () => {
+  const picks = [["npm:@relate/relate", "nuget:Relate.Net"], null];
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", ""], [], picks), ["npm:@relate/relate", "", "nuget:Relate.Net"]);
+  // a repo with nothing unticked sends nothing: the scan chooses for itself
+  assert.deepEqual(L.alignPackages(["r1"], [""], [], [null]), []);
+  // one pick fits in the slot, so nothing is left for the tail
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", "b"], [], [["pypi:relate-db"], null]), ["pypi:relate-db", "b"]);
+  // a package typed beside the repo keeps the slot; the picks follow it
+  assert.deepEqual(L.alignPackages(["r1"], ["mine"], [], [["npm:a", "npm:b"]]), ["mine", "npm:a", "npm:b"]);
+  // a pick the user also typed, with or without its prefix, counts once
+  assert.deepEqual(L.alignPackages(["r1"], ["relate-db"], [], [["pypi:relate-db", "npm:x"]]), ["relate-db", "npm:x"]);
+  assert.deepEqual(L.alignPackages(["r1"], [""], ["npm:x"], [["npm:x", "npm:y"]]), ["npm:x", "npm:y"]);
+  // the same bare name in two ecosystems is two packages
+  assert.deepEqual(L.alignPackages(["r1"], [""], [], [["pypi:x", "npm:x"]]), ["pypi:x", "npm:x"]);
+  // picks on a blank or duplicate repo row are ignored, as its typed package moves to the tail
+  assert.deepEqual(L.alignPackages(["r1", "r1"], ["", "z"], [], [["npm:a"], ["npm:b"]]), ["npm:a", "z"]);
+  assert.deepEqual(L.alignPackages(["", "r2"], ["", ""], [], [["npm:a"], ["npm:b"]]), ["npm:b"]);
+  // package-without-a-repo rows still follow the picks
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", ""], ["loose"], [["npm:a", "npm:b"], null]), ["npm:a", "", "npm:b", "loose"]);
+});
+
+test("detectedPicks is null while every box is ticked", () => {
+  const specs = ["pypi:a", "npm:b"];
+  assert.equal(L.detectedPicks(specs, ["npm:b", "pypi:a"]), null);
+  assert.deepEqual(L.detectedPicks(specs, ["npm:b"]), ["npm:b"]);
+  assert.deepEqual(L.detectedPicks(specs, []), []);
+});
+
+test("detectedLine and otherNote describe what was found", () => {
+  assert.deepEqual(L.detectedLine({ name: "relate-db", import_name: "relate", ecosystem: "pypi", path: "surfaces/relate-python" }),
+                   { name: "relate-db", meta: "PyPI · import relate · surfaces/relate-python" });
+  assert.deepEqual(L.detectedLine({ name: "@relate/relate", import_name: "@relate/relate", ecosystem: "npm", path: "" }),
+                   { name: "@relate/relate", meta: "npm" });
+  assert.equal(L.otherNote(["rust", "go", "java"]), "Also contains Rust, Go and Java — no checker for them yet.");
+  assert.equal(L.otherNote(["swift"]), "Also contains Swift — no checker for it yet.");
+  assert.equal(L.otherNote([]), "");
+});
+
+const COVERAGE = {
+  tiers: { execute: 4, structural: 10, unverifiable: 172 },
+  unverifiable: { "no-package": 120, "not-code": 35, "no-checker": 17 },
+  no_checker: { go: 8, rust: 9 },
+  labels: { "no-package": "use no scanned package", "not-code": "not code", "no-checker": "no checker" },
+};
+
+test("coverageView says what was checked and why the rest was not", () => {
+  const v = L.coverageView(COVERAGE);
+  assert.deepEqual([v.total, v.checked, v.unchecked], [186, 14, 172]);
+  assert.deepEqual(v.reasons.map((r) => [r.label, r.n, r.detail]),
+    [["use no scanned package", 120, ""], ["not code", 35, ""], ["no checker", 17, "rust 9, go 8"]]);
+  assert.equal(L.coverageSentence(v),
+    "186 snippets · 14 checked · 172 not checked: 120 use no scanned package · 35 not code · 17 no checker (rust 9, go 8)");
+  // a reason the labels do not know shows its code; counts sort even if the report did not
+  const odd = L.coverageView({ tiers: { structural: 1, unverifiable: 3 }, unverifiable: { a: 1, b: 2 } });
+  assert.deepEqual(odd.reasons.map((r) => r.label), ["b", "a"]);
+  assert.equal(L.coverageSentence(L.coverageView({ tiers: { execute: 2 } })), "2 snippets · 2 checked · 0 not checked");
+});
+
+test("coverageView is null without a coverage block or without snippets", () => {
+  assert.equal(L.coverageView(undefined), null);
+  assert.equal(L.coverageView({ tiers: { execute: 0, structural: 0, unverifiable: 0 } }), null);
+});
+
 test("cardState", () => {
   assert.equal(L.cardState(scan()), "new");
   assert.equal(L.cardState(scan({ runs: [run("2026-09-01T00:00:00", 2)] })), "rot");
@@ -118,6 +181,14 @@ test("normalizeReport upgrades single-source reports", () => {
                                  { kind: "repo", url: "https://github.com/o/r", pages: 1 }]);
   assert.equal(rep.packages[0].package, "r");
   assert.deepEqual(L.timelineGroups({ ...rep, timeline: [{ n: "a" }] })[0].rows, [{ n: "a" }]);
+});
+
+test("normalizeReport keeps coverage when present and tolerates its absence", () => {
+  const base = { docs_urls: ["d"], repo_urls: [], packages: [{ package: "p" }], sources: [], sections: [] };
+  assert.equal(L.normalizeReport({ ...base }).coverage, undefined);
+  assert.equal(L.coverageView(L.normalizeReport({ ...base }).coverage), null);
+  assert.deepEqual(L.normalizeReport({ ...base, coverage: COVERAGE }).coverage, COVERAGE);
+  assert.equal(L.normalizeReport({ ...base, coverage: "junk" }).coverage, undefined);
 });
 
 test("timelineGroups splits rows by package and drops empty groups", () => {

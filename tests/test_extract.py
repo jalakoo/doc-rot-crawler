@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from docrot.extract import fences, symbols, tiers
-from docrot.extract.pipeline import attribute
+from docrot.extract.pipeline import attribute, match_languages
 from docrot.models import PackageRef, Page, Snippet
 
 
@@ -102,3 +102,31 @@ def test_grounding_without_a_symbol_table_keeps_the_model_symbols():
     [kept] = ground([Claim(id="c", page="?", text="Some prose about build_graph and files.",
                            symbols=["build_graph"])], pages, set())
     assert kept.symbols == ["build_graph"] and kept.page == "https://a.io/g"
+
+
+# -------------------------------------------------------------- reasons
+
+def test_a_fence_language_falls_in_one_family():
+    got = {lang: fences.family(lang) for lang in
+           ("Python", "ts", "csharp", "zsh", "rust", "swift", "cypher", "yml", "")}
+    assert got == {"Python": "python", "ts": "javascript", "csharp": "csharp", "zsh": "shell",
+                   "rust": "other-code", "swift": "other-code", "cypher": "not-code",
+                   "yml": "not-code", "": "not-code"}
+
+
+def test_a_nuget_scan_labels_python_and_neutral_shell_and_c_sharp_fragments():
+    nuget = PackageRef(package="Acme.Core", import_name="Acme.Core", ecosystem="nuget")
+    py = Snippet(id="a", page="p", lang="python", code="print(1)")
+    sh = Snippet(id="b", page="p", lang="bash", code="dotnet add package Acme.Core")
+    frag = Snippet(id="c", page="p", lang="csharp", code="using Acme.Core;")
+    full = Snippet(id="d", page="p", lang="csharp",
+                   code="using Acme.Core;\nclass P { static void Main() { } }")
+    tiers.assign([py, sh, frag, full], set(), ["Acme.Core"])
+    attribute([py, sh, frag, full], [nuget])
+    match_languages([py, sh, frag, full], [nuget])
+    assert [(s.tier, s.reason) for s in (py, sh, frag, full)] == [
+        ("unverifiable", "other-language"),
+        ("unverifiable", "no-package-use"),
+        ("unverifiable", "fragment"),
+        ("structural", ""),
+    ]

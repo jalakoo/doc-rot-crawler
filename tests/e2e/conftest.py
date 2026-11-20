@@ -29,15 +29,23 @@ class Dashboard:
         self.store = Store(root)
         cfg = Config(neo4j_uri="bolt://127.0.0.1:1")
         self.fail_next = ""
+        # repo -> what "Detect packages" finds there; anything else is unreadable.
+        # Offline and instant, where the real one clones.
+        self.detections: dict[str, dict] = {}
+        self.detected: list[list[str]] = []
 
         def execute(store, scan_id):
             fail, self.fail_next = self.fail_next, ""
             execute_scan(store, scan_id, runner=fake_runner(delay=delay, fail=fail), cfg=cfg)
 
+        def detect(repo):
+            self.detected.append([repo])
+            return self.detections.get(repo) or {"repo": repo, "error": "repository not found."}
+
         self.worker = ScanWorker(self.store, execute)
         port = _free_port()
         self.url = f"http://127.0.0.1:{port}"
-        self.server = uvicorn.Server(uvicorn.Config(create_app(self.store, self.worker),
+        self.server = uvicorn.Server(uvicorn.Config(create_app(self.store, self.worker, detect=detect),
                                                     host="127.0.0.1", port=port, log_level="warning"))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 

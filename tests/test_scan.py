@@ -252,3 +252,364 @@ def test_source_install_points_at_the_package_inside_a_monorepo(tmp_path):
     # a local checkout the sandbox cannot see, and an unknown commit
     assert _source_spec("/local/path", "abc123", clone, clone) == ""
     assert _source_spec("https://github.com/o/r", "local", clone, clone) == ""
+
+
+# ------------------------------------------------- several packages per scan
+RELATE_DOCS = """\
+# Relate
+
+```python
+import relate
+relate.connect()
+```
+
+```js
+import { Relate } from "@relate/relate";
+new Relate();
+```
+
+```csharp
+using Relate.Net;
+var db = new RelateClient();
+```
+"""
+
+
+def _polyglot(root):
+    """Relate's shape: one repo, a package in each of PyPI, npm and NuGet."""
+    (root / "py" / "relate").mkdir(parents=True)
+    (root / "py" / "pyproject.toml").write_text('[project]\nname = "relate-db"\n')
+    (root / "py" / "relate" / "__init__.py").write_text("def connect(): ...\n")
+    (root / "js").mkdir()
+    (root / "js" / "package.json").write_text('{"name": "@relate/relate", "version": "1.0.0"}')
+    (root / "js" / "index.js").write_text("export class Relate {}\n")
+    (root / "dotnet" / "Relate.Net").mkdir(parents=True)
+    (root / "dotnet" / "Relate.Net" / "Relate.Net.csproj").write_text(
+        "<Project><PropertyGroup><PackageId>Relate.Net</PackageId></PropertyGroup></Project>")
+    (root / "dotnet" / "Relate.Net" / "Client.cs").write_text(
+        "namespace Relate.Net { public class RelateClient { public void Run() {} } }\n")
+    (root / "README.md").write_text("# relate\n")
+    return root
+
+
+@pytest.fixture
+def lanes(offline, monkeypatch, tmp_path):
+    """The polyglot repo as the only clone, docs that cover all three of its
+    packages, and a recording stand-in for each lane."""
+    import docrot.acquire as acq
+    import docrot.acquire.repo as repo
+    import docrot.verify as verify
+    import docrot.verify.dotnet as dotnet
+
+    root = _polyglot(tmp_path / "relate")
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (root, "abc123", "main"))
+    monkeypatch.setattr(repo, "ensure_sources", lambda *a, **kw: True)
+    seen = {"docs": RELATE_DOCS, "npm": [], "dotnet": [], "lookups": []}
+
+    async def acquire_site(url, fetcher, max_pages, log):
+        return [Page(url=f"{url}/docs/start", path="/docs/start", title="Start", origin=url,
+                     text=seen["docs"])], "llms.txt"
+
+    def lanes_result(snips, versions):
+        return [Result(id=s.id, page=s.page, version=v, status="pass") for s in snips for v in versions]
+
+    async def run_npm_matrix(snips, package, versions, cfg, log):
+        seen["npm"].append((package, len(snips)))
+        return lanes_result(snips, versions)
+
+    async def run_dotnet_matrix(snips, package, ns, versions, cfg, log, head=None):
+        seen["dotnet"].append((package, len(snips)))
+        return lanes_result(snips, versions)
+
+    def releases(package, ecosystem):
+        seen["lookups"].append((package, ecosystem))
+        return [Release(label="1.0", released_at="2026-01-01")]
+
+    monkeypatch.setattr(acq, "acquire_site", acquire_site)
+    monkeypatch.setattr(acq, "releases", releases)
+    monkeypatch.setattr(verify, "run_npm_matrix", run_npm_matrix)
+    monkeypatch.setattr(dotnet, "run_dotnet_matrix", run_dotnet_matrix)
+    seen["root"] = root
+    return seen
+
+
+def _scan(**kw):
+    kw.setdefault("docs", ["https://a.io"])
+    kw.setdefault("repos", ["https://github.com/o/relate"])
+    return ScanInputs(**kw)
+
+
+def _targets(out):
+    return [(t["package"], t["ecosystem"]) for t in out.report["packages"]]
+
+
+def test_a_polyglot_repo_yields_a_target_per_package_each_in_its_own_lane(
+        offline, lanes, cfg, monkeypatch):
+    import docrot.extract as extract_pkg
+    imports = {}
+    real = extract_pkg.extract
+
+    def spy(pages, targets, *a, **kw):
+        imports.update({t.package: t.import_name for t in targets})
+        return real(pages, targets, *a, **kw)
+
+    monkeypatch.setattr(extract_pkg, "extract", spy)
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+
+    assert _targets(out) == [("relate-db", "pypi"), ("@relate/relate", "npm"),
+                             ("Relate.Net", "nuget")]
+    assert imports == {"relate-db": "relate", "@relate/relate": "@relate/relate",
+                       "Relate.Net": "Relate.Net"}
+    assert [m[0] for m in offline["matrix"]] == ["relate-db"]
+    assert [p for p, _ in lanes["npm"]] == ["@relate/relate"]
+    assert [p for p, _ in lanes["dotnet"]] == ["Relate.Net"]
+    assert any("relate-db (pypi) · import relate · " in line and "public symbols at HEAD" in line
+               for line in lines)
+
+
+def test_the_primary_is_the_package_a_single_package_scan_picked(offline, lanes, cfg):
+    """Perseus, Streamlit and the rest verified `find_package`'s pick; widening
+    must not hand extraction's fallback attribution to a different package."""
+    out = run(run_scan(_scan(), cfg, lambda m: None))
+    assert out.extraction.package == "relate-db"
+    assert out.extraction.packages[0].package == "relate-db"
+
+
+def test_automatic_selection_skips_packages_the_docs_never_mention(offline, lanes, cfg):
+    lanes["docs"] = "```python\nimport relate\nrelate.connect()\n```\n"
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert _targets(out) == [("relate-db", "pypi")]
+    skipped = next(line for line in lines if "skipped" in line)
+    assert "never mention" in skipped and "npm:@relate/relate" in skipped \
+        and "nuget:Relate.Net" in skipped and "name them to include them" in skipped
+    assert lanes["npm"] == [] and lanes["dotnet"] == []
+
+
+def test_a_bare_word_in_prose_is_not_a_mention(offline, lanes, cfg):
+    """`relate` and `Relate` are on every page of Relate's docs."""
+    lanes["docs"] = ("Relate lets you relate things. Relate is fast, and relate is simple.\n\n"
+                     "```python\nimport relate\n```\n")
+    out = run(run_scan(_scan(), cfg, lambda m: None))
+    assert _targets(out) == [("relate-db", "pypi")]
+
+
+def test_an_install_command_is_a_mention(offline, lanes, cfg):
+    lanes["docs"] = "```bash\nnpm install @relate/relate\npip install relate-db\n```\n"
+    out = run(run_scan(_scan(), cfg, lambda m: None))
+    assert _targets(out) == [("relate-db", "pypi"), ("@relate/relate", "npm")]
+
+
+def test_a_repo_whose_docs_mention_nothing_verifies_its_single_best_package(offline, lanes, cfg):
+    lanes["docs"] = "Nothing about packages here.\n"
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert _targets(out) == [("relate-db", "pypi")]
+    assert any("mention none of them" in line and "name others to include them" in line
+               for line in lines)
+
+
+def test_automatic_selection_is_capped_per_repo(offline, lanes, cfg, monkeypatch):
+    monkeypatch.setattr(scanmod, "MAX_AUTO_PACKAGES", 2)
+    lines = []
+    out = run(run_scan(_scan(), cfg, lines.append))
+    assert len(out.report["packages"]) == 2
+    assert out.report["packages"][0]["package"] == "relate-db"
+    assert any("past the cap of 2" in line for line in lines)
+
+
+def test_the_cap_never_applies_to_packages_the_scan_names(offline, lanes, cfg, monkeypatch):
+    monkeypatch.setattr(scanmod, "MAX_AUTO_PACKAGES", 1)
+    out = run(run_scan(_scan(packages=["relate-db", "npm:@relate/relate", "Relate.Net"]),
+                       cfg, lambda m: None))
+    assert len(out.report["packages"]) == 3
+
+
+def test_naming_one_package_restricts_its_repo_to_it(offline, lanes, cfg):
+    out = run(run_scan(_scan(packages=["Relate.Net"]), cfg, lambda m: None))
+    assert _targets(out) == [("Relate.Net", "nuget")]
+
+
+def test_a_package_is_matched_by_unscoped_tail_case_and_any_position(offline, lanes, cfg):
+    """`--repo A --repo B --package relate` finds it in whichever repo has it, and
+    `relate` means `@relate/relate` as `wizard` means `@momentic/wizard`."""
+    out = run(run_scan(_scan(packages=["", "RELATE_DB", "npm:relate"]), cfg, lambda m: None))
+    assert _targets(out) == [("relate-db", "pypi"), ("@relate/relate", "npm")]
+
+
+def test_a_prefix_picks_between_packages_that_share_a_name(offline, lanes, cfg):
+    """`relate` answers to both `relate-db`'s import and `@relate/relate`'s tail;
+    the prefix says which was meant."""
+    out = run(run_scan(_scan(packages=["npm:relate"]), cfg, lambda m: None))
+    assert _targets(out) == [("@relate/relate", "npm")]
+
+
+def test_a_named_package_the_repo_lacks_is_verified_from_the_registry_with_the_repo_linked(
+        offline, lanes, cfg):
+    out = run(run_scan(_scan(packages=["npm:relate-extras"]), cfg, lambda m: None))
+    [t] = out.report["packages"]
+    assert (t["package"], t["ecosystem"]) == ("relate-extras", "npm")
+    assert out.extraction.packages[0].repo_url == "https://github.com/o/relate"
+    assert lanes["npm"] and offline["matrix"] == []
+
+
+def test_a_registry_only_package_with_a_prefix_never_asks_the_registries(offline, lanes, cfg):
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], packages=["nuget:Some.Lib"],
+                                  options=ScanOptions(ecosystem="auto")), cfg, lambda m: None))
+    assert _targets(out) == [("Some.Lib", "nuget")]
+    assert lanes["lookups"] == [("Some.Lib", "nuget")]       # only the release listing itself
+
+
+def _on(monkeypatch, *registries):
+    """Make a name exist on exactly these registries."""
+    import docrot.acquire as acq
+    seen = []
+
+    def releases(package, ecosystem):
+        seen.append((package, ecosystem))
+        return [Release(label="1.0", released_at="2026-01-01")] if ecosystem in registries else []
+
+    monkeypatch.setattr(acq, "releases", releases)
+    return seen
+
+
+def test_auto_uses_the_one_registry_that_has_a_registry_only_name(offline, lanes, cfg, monkeypatch):
+    _on(monkeypatch, "npm")
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], packages=["momentic"],
+                                  options=ScanOptions(ecosystem="auto")), cfg, lambda m: None))
+    assert _targets(out) == [("momentic", "npm")]
+
+
+def test_auto_stops_when_several_registries_have_the_name_and_shows_the_prefix(
+        offline, lanes, cfg, monkeypatch):
+    _on(monkeypatch, "pypi", "npm")
+    with pytest.raises(ScanError) as e:
+        run(run_scan(ScanInputs(docs=["https://a.io"], packages=["relate"],
+                                options=ScanOptions(ecosystem="auto")), cfg, lambda m: None))
+    msg = str(e.value)
+    assert "pypi and npm" in msg and "pypi:relate" in msg and "npm:relate" in msg
+
+
+def test_auto_stops_when_no_registry_has_the_name(offline, lanes, cfg, monkeypatch):
+    _on(monkeypatch)
+    with pytest.raises(ScanError, match=r"no package to verify.*nothing-here.*PyPI, npm or NuGet"):
+        run(run_scan(ScanInputs(docs=["https://a.io"], packages=["nothing-here"],
+                                options=ScanOptions(ecosystem="auto")), cfg, lambda m: None))
+
+
+def test_auto_treats_an_unpublished_package_linked_to_a_repo_as_pypi_from_source(
+        offline, lanes, cfg, monkeypatch):
+    """switch-core is on no registry; its repo is what gets installed."""
+    _on(monkeypatch)
+    out = run(run_scan(_scan(packages=["switch-core-x"], options=ScanOptions(ecosystem="auto")),
+                       cfg, lambda m: None))
+    assert _targets(out) == [("switch-core-x", "pypi")]
+
+
+def test_a_scoped_name_under_auto_is_npm_without_a_lookup(offline, lanes, cfg, monkeypatch):
+    seen = _on(monkeypatch)
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], packages=["@acme/tool"],
+                                  options=ScanOptions(ecosystem="auto")), cfg, lambda m: None))
+    assert _targets(out) == [("@acme/tool", "npm")]
+    assert ("@acme/tool", "pypi") not in seen
+
+
+def test_an_old_style_record_still_means_the_same(offline, cfg, monkeypatch, tmp_path):
+    """momentic-532a75: ecosystem npm, one positional package, a repo that holds
+    only docs. The package comes from npm, linked to the repo, never from PyPI,
+    and no registry is asked which one it is on."""
+    import docrot.acquire as acq
+    import docrot.acquire.repo as repo
+    npm_calls = _as_npm(monkeypatch)
+    docs_only = tmp_path / "cli"
+    docs_only.mkdir()
+    (docs_only / "README.md").write_text("# docs\n")
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (docs_only, "abc123", "main"))
+    monkeypatch.setattr(repo, "find_package", lambda p, **kw: ("", "", "pypi", p))
+    lookups = []
+    monkeypatch.setattr(acq, "releases", lambda p, e: lookups.append((p, e)) or
+                        [Release(label="1.0.0", released_at="2026-01-01")])
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/cli"],
+                                  packages=["momentic"], options=ScanOptions(ecosystem="npm")),
+                       cfg, lambda m: None))
+    [t] = out.report["packages"]
+    assert (t["package"], t["ecosystem"]) == ("momentic", "npm")
+    assert out.extraction.packages[0].repo_url == "https://github.com/o/cli"
+    assert lookups == [("momentic", "npm")] and npm_calls and offline["matrix"] == []
+
+
+def test_a_package_two_repos_both_hold_is_verified_once_with_both_heads(offline, cfg):
+    out = run(run_scan(ScanInputs(docs=["https://a.io"],
+                                  repos=["https://github.com/o/alpha", "https://x.io/p/alpha"]),
+                       cfg, lambda m: None))
+    assert [t["package"] for t in out.report["packages"]] == ["alpha"]
+    assert len(offline["matrix"]) == 1
+
+
+def test_the_same_name_on_two_registries_is_verified_once(offline, lanes, cfg):
+    """Results, snippets and the graph are keyed by package name."""
+    lines = []
+    out = run(run_scan(_scan(packages=["relate-db", "npm:relate-db"]), cfg, lines.append))
+    assert _targets(out) == [("relate-db", "pypi")]
+    assert any("is on pypi and npm" in line for line in lines)
+
+
+def test_a_repo_with_no_package_says_what_was_looked_for_and_what_was_seen(
+        offline, cfg, monkeypatch, tmp_path):
+    import docrot.acquire.repo as repo
+    rust = tmp_path / "relate"
+    (rust / "crates").mkdir(parents=True)
+    (rust / "crates" / "Cargo.toml").write_text("[package]\nname='core'\n")
+    (rust / "go.mod").write_text("module relate\n")
+    (rust / "README.md").write_text("# relate\n")
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (rust, "abc123", "main"))
+    lines = []
+    with pytest.raises(ScanError) as e:
+        run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/relate"]),
+                     cfg, lines.append))
+    want = ("no PyPI, npm or NuGet package found in relate; it does contain Cargo.toml, go.mod "
+            "- docrot has no lane for those yet")
+    assert want in str(e.value) and "--package" in str(e.value)
+    assert any(want in line for line in lines)
+
+
+def test_a_repo_with_no_package_and_nothing_else_says_only_what_was_looked_for(tmp_path):
+    (tmp_path / "README.md").write_text("# docs\n")
+    assert scanmod.nothing_found(tmp_path, "docs") == "no PyPI, npm or NuGet package found in docs"
+
+
+def test_a_net_monorepo_is_capped_but_a_named_package_beyond_the_cap_is_kept(
+        offline, cfg, monkeypatch, tmp_path):
+    import docrot.acquire as acq
+    import docrot.acquire.repo as repo
+    import docrot.verify.dotnet as dotnet
+    root = tmp_path / "products"
+    for n in range(9):
+        d = root / "src" / f"Acme.P{n}"
+        d.mkdir(parents=True)
+        (d / f"Acme.P{n}.csproj").write_text(
+            f"<Project><PropertyGroup><PackageId>Acme.P{n}</PackageId></PropertyGroup></Project>")
+        (d / "A.cs").write_text(f"namespace Acme.P{n} {{ public class C{n} {{}} }}\n")
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (root, "abc123", "main"))
+    ran = []
+
+    async def run_dotnet_matrix(snips, package, ns, versions, cfg, log, head=None):
+        ran.append(package)
+        return []
+
+    monkeypatch.setattr(dotnet, "run_dotnet_matrix", run_dotnet_matrix)
+    monkeypatch.setattr(acq, "releases", lambda p, e: [Release(label="1.0", released_at="2026-01-01")])
+
+    async def acquire_site(url, fetcher, max_pages, log):
+        text = "".join(f"```csharp\nusing Acme.P{n};\nvar c = new C{n}();\n```\n" for n in range(9))
+        return [Page(url=f"{url}/d", path="/d", title="D", origin=url, text=text)], "llms.txt"
+
+    monkeypatch.setattr(acq, "acquire_site", acquire_site)
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/products"]),
+                       cfg, lambda m: None))
+    assert len(out.report["packages"]) == scanmod.MAX_AUTO_PACKAGES
+
+    named = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/products"],
+                                    packages=["Acme.P8"]), cfg, lambda m: None))
+    assert [t["package"] for t in named.report["packages"]] == ["Acme.P8"]

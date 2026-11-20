@@ -154,6 +154,13 @@ def test_nuget_packages_skip_tests_samples_and_apps(tmp_path):
     assert found == {"Acme.Core": "Acme.Core", "Acme.Web": "Acme.AspNetCore"}
 
 
+def test_a_clients_folder_disqualifies_only_projects_without_a_package_id(tmp_path):
+    _csproj(tmp_path / "clients/src/ConsoleCode/ConsoleCode.csproj")          # Duende's sample client
+    _csproj(tmp_path / "clients/dotnet/src/Relate.Net/Relate.Net.csproj", "<PackageId>Relate.Net</PackageId>")
+    _csproj(tmp_path / "samples/Demo/Demo.csproj", "<PackageId>Acme.Demo</PackageId>")   # samples never
+    assert [p.id for p in nuget_packages(tmp_path)] == ["Relate.Net"]
+
+
 def test_root_namespace_is_spelled_as_the_code_declares_it(tmp_path):
     _csproj(tmp_path / "src/Bff/Bff.csproj", "<AssemblyName>Acme.BFF</AssemblyName>")
     (tmp_path / "src/Bff/Endpoints.cs").write_text("namespace Acme.Bff.Endpoints;\n")

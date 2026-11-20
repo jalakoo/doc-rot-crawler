@@ -10,8 +10,9 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import CACHE
@@ -107,6 +108,20 @@ def _effective_url(repo: str, plain: bool = False) -> str:
     return out or repo
 
 
+# One lock per cached clone. `clone` builds in `<dest>.partial` and renames it
+# into place, so two clones of one new repo delete each other's work in progress,
+# and a fetch racing a fetch trips over git's own index.lock. Every caller - a
+# scan's worker thread, a detect from the dashboard or an agent - goes through
+# `clone`, so the lock lives there rather than being something callers remember.
+_clone_locks: dict[str, threading.Lock] = {}
+_clone_guard = threading.Lock()
+
+
+def clone_lock(repo: str) -> threading.Lock:
+    with _clone_guard:
+        return _clone_locks.setdefault(repo.strip(), threading.Lock())
+
+
 def clone(repo: str, log=print, timeout: int = CLONE_TIMEOUT) -> tuple[Path, str, str]:
     """Shallow, sparse clone - or refresh of the cached one. Returns
     (path, commit_sha, default_branch).
@@ -124,6 +139,11 @@ def clone(repo: str, log=print, timeout: int = CLONE_TIMEOUT) -> tuple[Path, str
         sha = _git(dest, "rev-parse", "HEAD") or "local"
         return dest, sha[:12], _git(dest, "rev-parse", "--abbrev-ref", "HEAD") or "?"
 
+    with clone_lock(repo):
+        return _clone_remote(repo, log, timeout)
+
+
+def _clone_remote(repo: str, log, timeout: int) -> tuple[Path, str, str]:
     key = hashlib.sha1(repo.encode(), usedforsecurity=False).hexdigest()[:8]
     dest = CACHE / f"repo-{repo_name(repo)}-{key}"
 
@@ -259,56 +279,330 @@ def package_meta(path: Path) -> tuple[str, str, str]:
     return dist, imp, eco
 
 
+@dataclass(frozen=True)
+class Package:
+    name: str          # distribution name on its registry: 'relate-db', '@relate/relate', 'Relate.Net'
+    import_name: str   # what code imports: 'relate', '@relate/relate', 'Relate.Net' (root namespace)
+    ecosystem: str     # 'pypi' | 'npm' | 'nuget'
+    root: Path         # the directory to read its source from
+    dev: bool = field(default=False, compare=False, repr=False)   # a dev-workspace pyproject
+
+    def as_tuple(self) -> tuple[str, str, str, Path]:
+        return self.name, self.import_name, self.ecosystem, self.root
+
+
 def find_package(path: Path, hint: str = "", want: str = "",
                  rank=None) -> tuple[str, str, str, Path]:
-    """`package_meta` plus the directory that contains the import package.
+    """`package_meta` plus the directory that contains the import package: the
+    one package to verify, where `find_packages` lists them all.
 
-    Looks at the repo root, then one level down: monorepos keep the package
-    beside tooling. Streamlit's root pyproject.toml declares a `streamlit-dev`
-    workspace and the published package lives in lib/, so a package named like
-    the repo (`hint`) wins over the root; otherwise the root does. Python
-    metadata anywhere wins over a package.json, so a frontend folder is never
-    mistaken for the package.
+    Python metadata anywhere wins over a package.json, so a frontend folder is
+    never mistaken for the package. Streamlit's root pyproject.toml declares a
+    `streamlit-dev` workspace and the published package lives in lib/, so a
+    package named like the repo (`hint`) wins over the root; otherwise the
+    root does. `want` (`--package`) names the package to verify, in whatever
+    ecosystem it is.
 
-    A .NET repo is searched at any depth, because its packages live in
-    `src/<Name>/<Name>.csproj`, and a monorepo holds many: `want` names the one
-    to verify (`--package`), and otherwise `rank` - a score per package id,
-    in practice how often the docs mention it - picks one.
+    A .NET monorepo holds many packages: `rank` - a score per package id, in
+    practice how often the docs mention it - picks one, shortest id on a tie.
     """
+    if not path.is_dir():
+        return "", "", "pypi", path
+    found = _collect(path)
+    if want and (hit := next((p for p in _ordered(found, hint) if _answers_to(p, want)), None)):
+        return hit.as_tuple()
+
+    pypi = [p for p in _ordered(found, hint) if p.ecosystem == "pypi"]
+    if pypi:
+        return pypi[0].as_tuple()
+
+    dotnet = nuget_packages(path)
+    if dotnet:
+        pick = next((p for p in dotnet if want and _norm(p.id) == _norm(want)), None) \
+            or next((p for p in dotnet if hint and _norm(p.id) == _norm(hint)), None) \
+            or max(dotnet, key=lambda p: ((rank(p.id) if rank else 0), -len(p.id)))
+        return pick.id, pick.namespace, "nuget", pick.project.parent
+
+    found_npm = _npm_package(path, _bases(path), hint, want)
+    if found_npm:
+        return (found_npm[0], found_npm[0], "npm", found_npm[1])
+    npm = [p for p in _ordered(found, hint) if p.ecosystem == "npm"]
+    if npm:                                   # deeper than the old one-level search saw
+        return npm[0].as_tuple()
+    return "", "", "pypi", path
+
+
+def find_packages(path: Path, hint: str = "", rank=None) -> list[Package]:
+    """Every publishable package in a checkout, at any depth, in all three
+    ecosystems, best first.
+
+    Relate's one repo holds `relate-db` (surfaces/relate-python), `@relate/relate`
+    (clients/javascript) and `Relate.Net` (clients/dotnet/src/Relate.Net); a
+    search that returned one package, from the root or one level down, found
+    none of them. Order: a name matching `hint` (the repo name) first, then
+    `rank(name)` descending - how often the docs mention it - then the shallower
+    path, then the name. De-duplicated by (ecosystem, normalised name).
+
+    Not packages: test, example, sample, template, benchmark and fixture trees;
+    private npm packages (workspace roots, apps); npm platform sub-packages of
+    another package; pyprojects that only configure tools or a dev workspace;
+    the .NET projects `nuget_packages` rejects.
+    """
+    if not path.is_dir():
+        return []
+    return _ordered([p for p in _collect(path) if not p.dev], hint, rank)
+
+
+def _bases(path: Path) -> list[Path]:
     bases = [path]
     if path.is_dir():
         bases += sorted(d for d in path.iterdir()
                         if d.is_dir() and not d.name.startswith((".", "test", "doc")))
+    return bases
 
-    found = []
-    for base in bases:
-        pp = base / "pyproject.toml"
-        if not pp.exists():
-            continue
+
+def _answers_to(p: Package, wanted: str) -> bool:
+    """`--package wizard` means `@momentic/wizard`: the unscoped name counts."""
+    low = wanted.lower()
+    return low in (p.name.lower(), p.name.rsplit("/", 1)[-1].lower()) \
+        or _norm(p.name) == _norm(wanted)
+
+
+def _ordered(pkgs: list[Package], hint: str = "", rank=None) -> list[Package]:
+    """De-duplicated (a name published from two folders is one package; the
+    shallower folder is the one that is read) and ranked as `find_packages`
+    documents."""
+    def depth(p: Package) -> int:
+        return len(p.root.parts)
+
+    best: dict[tuple[str, str], Package] = {}
+    for p in sorted(pkgs, key=lambda p: (depth(p), str(p.root))):
+        best.setdefault((p.ecosystem, _norm(p.name)), p)
+
+    def key(p: Package):
+        named = bool(hint) and _answers_to(p, hint)
+        return (not named, -(rank(p.name) if rank else 0), depth(p), p.name.lower())
+
+    return sorted(best.values(), key=key)
+
+
+# ------------------------------------------------------------------ the walk
+# Directories nothing publishable lives in: VCS, dependencies, build output.
+# `vendor` and `third_party` hold other people's packages.
+WALK_SKIP = frozenset({"node_modules", "vendor", "third_party", "build", "dist", "out", "target",
+                       "bin", "obj", "venv", "env", "site-packages", "__pycache__"})
+# Trees that only demonstrate or exercise a package, whatever the ecosystem.
+DECOY_DIR = re.compile(r"(^|[._-])(tests?|testing|__tests__|samples?|examples?|templates?|"
+                       r"benchmarks?|fixtures?|playground|demos?|e2e)($|[._-])", re.I)
+# A Python or npm manifest under these is the docs site's, not the package's.
+DOC_DIRS = frozenset({"docs", "doc", "documentation", "website"})
+# Past this the walk stops: it is breadth-first, so what is found is the
+# shallowest part of a repo, and a Streamlit-sized checkout stays fast.
+MAX_WALK_DIRS = 20_000
+MANIFESTS = frozenset({"pyproject.toml", "setup.cfg", "package.json"})
+
+
+def _walk(path: Path) -> list[Path]:
+    """Every manifest (pyproject.toml, setup.cfg, package.json, *.csproj) in
+    the checkout, shallowest first, never entering what `WALK_SKIP` and
+    `DECOY_DIR` name, dot-directories or symlinks, and visiting at most
+    `MAX_WALK_DIRS` directories."""
+    found: list[Path] = []
+    queue = [path]
+    visited = 0
+    while queue and visited < MAX_WALK_DIRS:
+        here = queue.pop(0)
+        visited += 1
         try:
-            data = tomllib.loads(pp.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        proj = data.get("project") or data.get("tool", {}).get("poetry", {}) or {}
-        if proj.get("name"):
-            found.append((proj["name"], base))
-    if found:
-        dist, base = next(((d, b) for d, b in found if hint and _norm(d) == _norm(hint)), found[0])
-        imp, root = _guess_import(base, dist)
-        return dist, imp, "pypi", root
+            entries = sorted(os.scandir(here), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not (e.name.startswith(".") or e.name in WALK_SKIP
+                            or DECOY_DIR.search(e.name)):
+                        queue.append(Path(e.path))
+                elif e.name in MANIFESTS or e.name.endswith(".csproj"):
+                    found.append(Path(e.path))
+            except OSError:
+                continue
+    return found
 
-    if path.is_dir():
-        dotnet = nuget_packages(path)
-        if dotnet:
-            pick = next((p for p in dotnet if want and _norm(p.id) == _norm(want)), None) \
-                or next((p for p in dotnet if hint and _norm(p.id) == _norm(hint)), None) \
-                or max(dotnet, key=lambda p: ((rank(p.id) if rank else 0), -len(p.id)))
-            return pick.id, pick.namespace, "nuget", pick.project.parent
 
-    found_npm = _npm_package(path, bases, hint, want)
-    if found_npm:
-        return (found_npm[0], found_npm[0], "npm", found_npm[1])
-    return "", "", "pypi", path
+def _collect(path: Path) -> list[Package]:
+    """Every package the walk finds, before ordering and the dev-workspace
+    filter. npm and Python manifests inside a docs folder are not packages."""
+    manifests = _walk(path)
+    pkgs: list[Package] = []
+    for m in manifests:
+        rel = m.parent.relative_to(path).parts
+        in_docs = bool(DOC_DIRS & {part.lower() for part in rel})
+        if m.name == "pyproject.toml" and not in_docs:
+            pkgs += _python_package(m.parent)
+        elif m.name == "setup.cfg" and not in_docs and not (m.parent / "pyproject.toml").exists():
+            pkgs += _setup_cfg_package(m.parent)
+    pkgs += _npm_packages([m.parent for m in manifests if m.name == "package.json"
+                           and not DOC_DIRS & {x.lower() for x in m.parent.relative_to(path).parts}])
+    pkgs += [Package(p.id, p.namespace, "nuget", p.project.parent)
+             for p in _nuget_from([m for m in manifests if m.suffix == ".csproj"], path)]
+    return pkgs
+
+
+# ---------------------------------------------------------------------- npm
+def _npm_packages(dirs: list[Path]) -> list[Package]:
+    """Public npm packages among `dirs`, less each one's platform sub-packages.
+
+    `private` is a workspace root or an app, which nobody installs. A package
+    named in another's `optionalDependencies` (by name, or by a `file:` path)
+    is that package's per-platform binary, not something to verify; and one
+    living under another package's directory is dropped too, unless that
+    package declares `workspaces` - then its members are what it publishes.
+    """
+    manifests = {d: _package_json(d) for d in dirs}
+    manifests = {d: m for d, m in manifests.items() if isinstance(m.get("name"), str) and m["name"]}
+    sub_names: set[str] = set()
+    sub_dirs: set[Path] = set()
+    for d, m in manifests.items():
+        opt = m.get("optionalDependencies")
+        for name, spec in (opt.items() if isinstance(opt, dict) else []):
+            sub_names.add(name)
+            if isinstance(spec, str) and spec.startswith("file:"):
+                sub_dirs.add((d / spec[5:]).resolve())
+    out = []
+    for d, m in manifests.items():
+        if m.get("private") or m["name"] in sub_names or d.resolve() in sub_dirs:
+            continue
+        if any(o != d and o in d.parents and not o_m.get("private") and not o_m.get("workspaces")
+               for o, o_m in manifests.items()):
+            continue
+        out.append(Package(m["name"], m["name"], "npm", d))
+    return out
+
+
+# ------------------------------------------------------------------- python
+def _read_toml(path: Path) -> dict:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _python_package(base: Path) -> list[Package]:
+    """The package a pyproject.toml declares - none when it only configures
+    tools, which is a pyproject with no `[project]` or poetry name."""
+    data = _read_toml(base / "pyproject.toml")
+    proj = data.get("project") or data.get("tool", {}).get("poetry", {}) or {}
+    name = proj.get("name")
+    if not isinstance(name, str) or not name:
+        return []
+    imp, root = _python_import(base, name, data)
+    return [Package(name, imp, "pypi", root, dev=_is_dev_workspace(base, name, data))]
+
+
+def _setup_cfg_package(base: Path) -> list[Package]:
+    """A pre-pyproject package: `[metadata] name` in setup.cfg. setup.py is not
+    read - its `name=` is arbitrary code, and a regex over it would take the
+    first `name=` of any call as the package."""
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(base / "setup.cfg", encoding="utf-8")
+    except (configparser.Error, OSError):
+        return []
+    name = cp.get("metadata", "name", fallback="").strip()
+    if not name:
+        return []
+    imp, root = _guess_import(base, name)
+    return [Package(name, imp, "pypi", root)]
+
+
+def _is_dev_workspace(base: Path, name: str, data: dict) -> bool:
+    """A pyproject that declares no package of its own: Streamlit's root is
+    `streamlit-dev` 0.0.0 whose only dependency is the real package, which lives
+    in lib/. Build metadata names no module, no folder is named for it (the
+    directory heuristic would still find some stray package, `e2e_playwright`),
+    and it is named or versioned as development scaffolding, or is a uv
+    workspace root."""
+    if _declared_import(base, data):
+        return False
+    candidate = name.replace("-", "_").replace(".", "_")
+    if any((r / candidate).is_dir() or (r / f"{candidate}.py").is_file()
+           for r in (base, base / "src", base / "python")):
+        return False
+    dev_named = bool(re.search(r"[-_.]dev$", name, re.I)) \
+        or (data.get("project") or {}).get("version") == "0.0.0"
+    return dev_named or "workspace" in (data.get("tool", {}).get("uv") or {})
+
+
+def _python_import(base: Path, dist: str, data: dict) -> tuple[str, Path]:
+    """(import_name, directory containing it). The build metadata says where the
+    code is; the directory heuristics are the fallback.
+
+    Relate's `relate-db` imports as `relate`: `[tool.maturin] module-name =
+    "relate._native"` and `python-source = "python"`. The distribution name
+    cannot be turned into it - and an unrelated `relate` is on PyPI, so the
+    import name must never be turned back into the distribution name either."""
+    named = _declared_import(base, data)
+    if named:
+        name, root = named
+        if (root / name).is_dir() or (root / f"{name}.py").is_file():
+            return name, root
+    guess, root = _guess_import(base, dist)
+    if named and not (root / guess).is_dir():
+        return named
+    return guess, root
+
+
+def _top(name: str) -> str:
+    return name.replace("/", ".").split(".")[0]
+
+
+def _declared_import(base: Path, data: dict) -> tuple[str, Path] | None:
+    tool = data.get("tool", {})
+    # maturin: module-name's first segment, under python-source when set
+    maturin = tool.get("maturin") or {}
+    if isinstance(maturin.get("module-name"), str):
+        return _top(maturin["module-name"]), base / maturin.get("python-source", "")
+    # flit
+    flit = (tool.get("flit") or {}).get("module") or {}
+    if isinstance(flit.get("name"), str):
+        top = _top(flit["name"])
+        return top, next((r for r in (base, base / "src") if (r / top).exists()), base)
+    # uv's build backend
+    uv = (tool.get("uv") or {}).get("build-backend") or {}
+    if isinstance(uv.get("module-name"), str):
+        return _top(uv["module-name"]), base / uv.get("module-root", "src")
+    # hatch: packages = ["src/foo"]
+    wheel = (((tool.get("hatch") or {}).get("build") or {}).get("targets") or {}).get("wheel") or {}
+    hatch = [p for p in wheel.get("packages") or [] if isinstance(p, str)]
+    if hatch:
+        folder, _, top = hatch[0].rstrip("/").rpartition("/")
+        return top, base / folder
+    # poetry: packages = [{include = "foo", from = "src"}]
+    for entry in (tool.get("poetry") or {}).get("packages") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("include"), str):
+            return _top(entry["include"]), base / entry.get("from", "")
+    return _setuptools_import(base, tool.get("setuptools") or {})
+
+
+def _setuptools_import(base: Path, st: dict) -> tuple[str, Path] | None:
+    """`packages` (a list, or `find` with `where`) and `package-dir`'s root."""
+    pkg_dir = st.get("package-dir") or {}
+    root = base / (pkg_dir.get("") or "") if isinstance(pkg_dir, dict) else base
+    packages = st.get("packages")
+    if isinstance(packages, list):
+        top = next((_top(p) for p in packages if isinstance(p, str)), "")
+        return (top, root) if top else None
+    find = packages.get("find") if isinstance(packages, dict) else None
+    if isinstance(find, dict):
+        where = find.get("where") or [""]
+        root = base / (where[0] if isinstance(where, list) and where else "")
+        top = next((d.name for d in sorted(root.iterdir()) if d.is_dir()
+                    and (d / "__init__.py").exists() and not d.name.startswith((".", "test"))),
+                   "") if root.is_dir() else ""
+        return (top, root) if top else None
+    return None
 
 
 def _package_json(directory: Path) -> dict:
@@ -374,9 +668,21 @@ def _npm_package(path: Path, bases: list[Path], hint: str, want: str) -> tuple[s
     return first["name"], first_dir
 
 
-NOT_A_PACKAGE = re.compile(r"(^|[/\\._-])(tests?|testing|samples?|examples?|templates?|benchmarks?|"
-                           r"performance|playground|demo|hosts?|clients|migrations|shared)"
-                           r"($|[/\\._-])", re.I)
+NOT_A_PACKAGE_WORDS = ("tests?", "testing", "samples?", "examples?", "templates?", "benchmarks?",
+                       "performance", "playground", "demo", "hosts?", "migrations", "shared")
+
+
+def _folder_re(words) -> re.Pattern:
+    return re.compile(rf"(^|[/\\._-])({'|'.join(words)})($|[/\\._-])", re.I)
+
+
+# Where a project is never a package. `clients` is the exception: Duende's
+# `clients/` folders hold sample console apps and APIs, but Relate's
+# `clients/dotnet/src/Relate.Net` is the product, a client library. So `clients`
+# disqualifies a project only when it states no `<PackageId>` - a sample app
+# never packs itself, a library headed for NuGet always does.
+LIBRARY_FOLDERS = _folder_re(NOT_A_PACKAGE_WORDS)
+NOT_A_PACKAGE = _folder_re((*NOT_A_PACKAGE_WORDS, "clients"))
 
 
 @dataclass
@@ -390,9 +696,16 @@ def nuget_packages(path: Path) -> list[NugetPackage]:
     """Every packable project in a repo: a library outside test, sample and
     template folders, not marked `<IsPackable>false`. Its id is the PackageId,
     else the assembly name."""
+    if not path.is_dir():
+        return []
+    return _nuget_from([m for m in _walk(path) if m.suffix == ".csproj"], path)
+
+
+def _nuget_from(projects: list[Path], path: Path) -> list[NugetPackage]:
     out = []
-    for proj in sorted(path.rglob("*.csproj")):
+    for proj in sorted(projects):
         rel = proj.relative_to(path).as_posix()
+        folder = rel.rsplit("/", 1)[0] if "/" in rel else ""
         try:
             xml = proj.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -400,9 +713,10 @@ def nuget_packages(path: Path) -> list[NugetPackage]:
         if re.search(r"<IsPackable>\s*false\s*</IsPackable>", xml, re.I) \
                 or re.search(r"<OutputType>\s*(Win)?Exe\s*</OutputType>", xml, re.I):
             continue
-        if NOT_A_PACKAGE.search(rel.rsplit("/", 1)[0]):
+        explicit = _prop(xml, "PackageId")
+        if LIBRARY_FOLDERS.search(folder) or (not explicit and NOT_A_PACKAGE.search(folder)):
             continue
-        name = _prop(xml, "PackageId") or _prop(xml, "AssemblyName") or proj.stem
+        name = explicit or _prop(xml, "AssemblyName") or proj.stem
         if "$(" in name:
             continue
         ns = _prop(xml, "RootNamespace")

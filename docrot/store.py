@@ -41,7 +41,10 @@ def now() -> str:
 
 
 class ScanOptions(BaseModel):
-    ecosystem: Literal["pypi", "npm", "nuget"] = "pypi"
+    # The default for a package no repo describes. "auto" asks the registries
+    # which one has it; "pypi" stays the model default so a record written
+    # before `auto` existed loads and scans exactly as it did.
+    ecosystem: Literal["auto", "pypi", "npm", "nuget"] = "pypi"
     versions: int = Field(3, ge=1, le=10)
     max_pages: int | None = Field(None, ge=1, le=2000)
     assume_credentialed: bool = False
@@ -173,10 +176,47 @@ def clean_sources(docs: list[str], repos: list[str]) -> tuple[list[str], list[st
     return docs, repos
 
 
+ECOSYSTEMS = ("pypi", "npm", "nuget")
+
+
+def split_package(entry: str) -> tuple[str, str]:
+    """`(ecosystem, name)` of a packages entry; the ecosystem is "" when the
+    entry carries no `pypi:`/`npm:`/`nuget:` prefix.
+
+    Only those three lowercase prefixes count. Names never hold a colon of
+    their own - `@relate/relate` has `@` and `/`, `Relate.Net` has dots - so a
+    colon always means a prefix, and an unknown one is `clean_packages`' to
+    reject rather than ours to guess at."""
+    entry = (entry or "").strip()
+    head, colon, rest = entry.partition(":")
+    if colon and head in ECOSYSTEMS:
+        return head, rest.strip()
+    return "", entry
+
+
 def clean_packages(packages: list[str] | None) -> list[str]:
     """Trimmed but still positional: packages[i] belongs to repos[i], so a blank
-    in the middle keeps its slot. Only trailing blanks are dropped."""
+    in the middle keeps its slot. Only trailing blanks are dropped.
+
+    An entry may start with `pypi:`, `npm:` or `nuget:` to say which registry
+    it is on (`npm:@relate/relate`); the form is normalised to `eco:name`.
+    Raises ValueError listing every entry with an unknown prefix or no name."""
     out = [(p or "").strip() for p in packages or []]
+    problems: list[str] = []
+    for i, entry in enumerate(out):
+        if not entry:
+            continue
+        eco, name = split_package(entry)
+        if eco:
+            out[i] = f"{eco}:{name}"
+            if not name:
+                problems.append(f"Package {i + 1} ({entry}) names no package after {eco}:.")
+        elif ":" in entry:
+            problems.append(f"Package {i + 1} ({entry}) has an unknown ecosystem prefix "
+                            f"'{entry.partition(':')[0]}:' - use pypi:, npm: or nuget: "
+                            "(lowercase), or no prefix.")
+    if problems:
+        raise ValueError(problems)
     while out and not out[-1]:
         out.pop()
     return out
@@ -191,7 +231,7 @@ def align_packages(repos: list[str], packages: list[str] | None) -> list[str]:
     later duplicate's package is used only when the first had none. Entries past
     the last repo are repo-less packages and stay at the end.
     """
-    pkgs = [(p or "").strip() for p in packages or []]
+    pkgs = clean_packages(packages)          # validated at the positions the user gave
     slot: dict[str, int] = {}
     out: list[str] = []
     for i, raw in enumerate(repos or []):

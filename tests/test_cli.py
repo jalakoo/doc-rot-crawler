@@ -89,3 +89,90 @@ def test_export_sarif(data, capsys, tmp_path):
     out = tmp_path / "f.sarif"
     assert cli.main(["export", "--format", "sarif", "-o", str(out)]) == 0
     assert "wrote" in capsys.readouterr().out and json.loads(out.read_text())["runs"]
+
+
+def test_package_flag_takes_prefixed_names_repeated_or_listed():
+    args = cli.parser().parse_args([
+        "scan", "--repo", "https://github.com/relatedb/relate",
+        "--package", "pypi:relate-db", "npm:@relate/relate", "--package", "nuget:Relate.Net"])
+    assert args.package == ["pypi:relate-db", "npm:@relate/relate", "nuget:Relate.Net"]
+
+
+def test_ecosystem_defaults_to_auto_and_accepts_the_three_registries():
+    p = cli.parser()
+    assert p.parse_args(["scan", "--repo", "./x"]).ecosystem == "auto"
+    for eco in ("pypi", "npm", "nuget", "auto"):
+        assert p.parse_args(["scan", "--repo", "./x", "--ecosystem", eco]).ecosystem == eco
+    with pytest.raises(SystemExit):
+        p.parse_args(["scan", "--repo", "./x", "--ecosystem", "cargo"])
+
+
+def test_scan_help_explains_automatic_selection(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["scan", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "the docs mention" in text and "at most 6 per repo" in text
+    assert "docrot packages" in text and "npm:@relate/relate" in text
+
+
+def test_scan_records_the_packages_and_ecosystem_it_was_given(data):
+    argv = ["scan", "--docs-url", "https://docs.a.io", "--repo", "https://github.com/a/alpha",
+            "--package", "npm:@a/alpha", "--ecosystem", "nuget"]
+    cli.main(argv)
+    [rec] = Store(data).all()
+    assert rec.packages == ["npm:@a/alpha"] and rec.options.ecosystem == "nuget"
+
+
+def test_scan_rejects_an_unknown_package_prefix(data, capsys):
+    assert cli.main(["scan", "--docs-url", "https://docs.a.io",
+                     "--package", "cargo:serde"]) == 2
+    assert "unknown ecosystem prefix 'cargo:'" in capsys.readouterr().out
+    assert Store(data).all() == []
+
+
+def _relate(tmp_path):
+    root = tmp_path / "relate"
+    (root / "py" / "relate").mkdir(parents=True)
+    (root / "py" / "pyproject.toml").write_text('[project]\nname = "relate-db"\n')
+    (root / "py" / "relate" / "__init__.py").write_text("")
+    (root / "js").mkdir()
+    (root / "js" / "package.json").write_text('{"name": "@relate/relate", "version": "1"}')
+    return root
+
+
+@pytest.fixture
+def cloned(monkeypatch, tmp_path):
+    import docrot.acquire.repo as repo
+    paths = {}
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (paths[r], "abc123", "main"))
+    return paths
+
+
+def test_packages_lists_what_a_repo_holds_with_the_name_to_pass_to_scan(cloned, tmp_path, capsys):
+    cloned["https://github.com/relatedb/relate"] = _relate(tmp_path)
+    assert cli.main(["packages", "https://github.com/relatedb/relate"]) == 0
+    out = capsys.readouterr().out
+    assert "pypi:relate-db" in out and "npm:@relate/relate" in out
+    assert "py" in out and "js" in out and "relate" in out
+    assert "--package eco:name" in out            # two packages: say how to choose
+
+
+def test_packages_says_what_it_saw_when_a_repo_holds_none(cloned, tmp_path, capsys):
+    rust = tmp_path / "rusty"
+    rust.mkdir()
+    (rust / "Cargo.toml").write_text("[package]\nname='x'\n")
+    cloned["./rusty"] = rust
+    assert cli.main(["packages", "./rusty"]) == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "no PyPI, npm or NuGet package found in rusty" in out and "Cargo.toml" in out
+
+
+def test_packages_reports_a_repo_it_cannot_fetch(monkeypatch, capsys):
+    import docrot.acquire.repo as repo
+
+    def refuse(r, log, timeout=600):
+        raise repo.CloneError("not found")
+
+    monkeypatch.setattr(repo, "clone", refuse)
+    assert cli.main(["packages", "https://github.com/o/nope"]) == 3
+    assert "couldn't fetch https://github.com/o/nope" in capsys.readouterr().out

@@ -164,6 +164,15 @@
             <div class="panel-bd"><ul class="srcs-list" id="sources"></ul></div>
           </section>
 
+          <section class="panel coverage" id="coverage" hidden>
+            <h2 class="panel-hd">Coverage <span class="hd-note">what was checked</span></h2>
+            <div class="panel-bd">
+              <p class="cov-sum" id="covSum"></p>
+              <div class="cov-bar" id="covBar" role="img"></div>
+              <ul class="cov-list" id="covList"></ul>
+            </div>
+          </section>
+
           <section class="panel">
             <h2 class="panel-hd">Docs site map <span class="hd-note">each tile is one page</span></h2>
             <div class="panel-bd" id="map"></div>
@@ -264,14 +273,20 @@
       <fieldset class="field code">
         <legend>Repositories</legend>
         <ol class="src-rows" id="repoRows"></ol>
-        <button class="add-row" type="button" data-add="repo">+ Add another repo</button>
+        <div class="row-actions">
+          <button class="add-row" type="button" data-add="repo">+ Add another repo</button>
+          <button class="add-row detect" type="button" id="detect">Detect packages</button>
+        </div>
+        <p class="detect-status" id="detectStatus" role="status"></p>
         <p class="hint">Git URL or local path. Every docs site is checked against the symbols of <b>every</b> repo listed.
-          Paste several at once &mdash; one per line.</p>
+          Paste several at once &mdash; one per line.
+          <b>Detect packages</b> looks inside each repo and lists what it ships, so you can choose.</p>
         <ol class="src-rows pkg-rows" id="pkgRows"></ol>
         <button class="add-row" type="button" data-add="pkg">+ Add a package without a repo</button>
         <p class="hint">Package is optional. Name it when a repo has no package metadata or ships several packages,
-          or to check a published package with no repo. Use the name on the registry chosen under
-          <b>Ecosystem</b> in Scan options.</p>
+          or to check a published package with no repo. Left empty, a repo contributes up to 6 packages
+          its docs mention; naming any package of a repo restricts it to those. Prefix it to pick the registry
+          (<b>pypi:name</b>, <b>npm:name</b>, <b>nuget:name</b>); a bare name with no repo uses the <b>Ecosystem</b> in Scan options.</p>
       </fieldset>
 
       <details class="opts">
@@ -279,7 +294,9 @@
         <div class="opt-grid">
           <div class="opt">
             <label for="fEco">Ecosystem</label>
-            <select class="inp" id="fEco"><option value="pypi">PyPI</option><option value="npm">npm</option><option value="nuget">NuGet</option></select>
+            <select class="inp" id="fEco"><option value="auto">Auto-detect</option><option value="pypi">PyPI</option><option value="npm">npm</option><option value="nuget">NuGet</option></select>
+            <p class="hint">Each repo's manifests decide. Only matters for a package named without a repo
+              and without a prefix.</p>
           </div>
           <div class="opt">
             <label for="fVers">Releases to test</label>

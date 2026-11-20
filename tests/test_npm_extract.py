@@ -4,8 +4,15 @@ from __future__ import annotations
 import pytest
 
 from docrot.extract import fences, symbols, tiers
-from docrot.extract.pipeline import _root, attribute, extract, match_languages
-from docrot.models import PackageRef, Page, Snippet
+from docrot.extract.pipeline import (
+    _root,
+    attribute,
+    extract,
+    match_languages,
+    not_checked_line,
+    prune_declares,
+)
+from docrot.models import REASONS, PackageRef, Page, Snippet
 
 NPM = PackageRef(package="momentic", import_name="momentic", ecosystem="npm")
 PYPI = PackageRef(package="alpha", import_name="alpha", ecosystem="pypi")
@@ -221,6 +228,8 @@ def test_shell_attributed_to_npm_must_install_or_run_it():
     match_languages([pip_only, ok, npm_for_pypi, pip_ok], [PYPI, NPM])
     assert [s.tier for s in (pip_only, ok, npm_for_pypi, pip_ok)] == \
         ["unverifiable", "execute", "unverifiable", "execute"]
+    assert [s.reason for s in (pip_only, ok, npm_for_pypi, pip_ok)] == \
+        ["no-package-use", "", "other-language", ""]
 
 
 # ------------------------------------------------------------------- sniffing
@@ -339,3 +348,127 @@ def test_a_python_only_scan_is_unchanged_by_the_npm_lane(cfg):
     assert rows[("bash", "npx momentic run x.yaml --ci")] == ("unverifiable", "alpha", [])
     assert rows[("bash", "pip install alpha")] == ("execute", "alpha", ["pip:alpha"])
     assert rows[("python", "import alpha")] == ("structural", "alpha", ["alpha", "alpha.go"])
+
+
+# -------------------------------------------------------------------- reasons
+
+# one fence per way of going unchecked, plus two that are checked
+CORPUS = '''# Mixed
+
+```rust
+fn main() {}
+```
+
+```swift
+let x = 1
+```
+
+```cypher
+MATCH (n) RETURN n
+```
+
+```json
+{"a": 1}
+```
+
+```python
+import alpha
+alpha.go()
+```
+
+```python
+print("hi")
+```
+
+```js
+import { run } from 'momentic'
+run()
+```
+
+```js
+import _ from 'lodash'
+_.chunk([1], 1)
+```
+
+```bash
+npm i momentic
+```
+
+```bash
+git clone https://example.com/x.git
+```
+
+```bash
+pip install alpha
+```
+'''
+
+
+def _reasons(packages, cfg, text=CORPUS):
+    ex = extract([_page("https://d.io/a", text)], packages, cfg, log=lambda *_: None)
+    return {(s.lang, s.code.splitlines()[0]): (s.tier, s.reason) for s in ex.snippets}
+
+
+def test_a_language_with_no_lane_is_no_checker_and_prose_is_not_code(cfg):
+    got = _reasons([NPM], cfg)
+    assert got[("rust", "fn main() {}")] == ("unverifiable", "no-checker")
+    assert got[("swift", "let x = 1")] == ("unverifiable", "no-checker")
+    assert got[("cypher", "MATCH (n) RETURN n")] == ("unverifiable", "not-code")
+    assert got[("json", '{"a": 1}')] == ("unverifiable", "not-code")
+
+
+def test_an_npm_only_scan_gives_python_other_language_and_unrelated_js_no_package_use(cfg):
+    got = _reasons([NPM], cfg)
+    assert got[("python", "import alpha")] == ("unverifiable", "other-language")
+    assert got[("js", "import _ from 'lodash'")] == ("unverifiable", "no-package-use")
+    assert got[("bash", "git clone https://example.com/x.git")] == ("unverifiable", "no-package-use")
+    assert got[("js", "import { run } from 'momentic'")] == ("structural", "")
+
+
+def test_a_pypi_only_scan_gives_js_other_language(cfg):
+    got = _reasons([PYPI], cfg)
+    assert got[("js", "import { run } from 'momentic'")] == ("unverifiable", "other-language")
+    assert got[("bash", "npm i momentic")] == ("unverifiable", "no-package-use")   # no npm to name
+    assert got[("python", "print(\"hi\")")][1] == ""
+
+
+def test_a_mixed_scan_labels_the_python_that_names_no_npm_package(cfg):
+    got = _reasons([NPM, PYPI], cfg)
+    # no package named: it falls to the primary, an npm one, so it is the wrong language
+    assert got[("python", 'print("hi")')] == ("unverifiable", "other-language")
+    assert got[("python", "import alpha")][1] == ""
+    assert got[("js", "import { run } from 'momentic'")][1] == ""
+
+
+def test_a_fragment_and_an_unowned_declaration_say_so(cfg):
+    ex = extract([_page("https://d.io/a", "```python\nresult = widget.run()\n```\n\n"
+                                          "```csharp\nvar x = Foo();\n```\n")],
+                 [PYPI], cfg, log=lambda *_: None)
+    assert [(s.lang, s.reason) for s in ex.snippets] == \
+        [("python", "fragment"), ("csharp", "other-language")]
+    decl = _snip("python", "class Model(BaseModel):\n    x: int")
+    decl.tier, decl.kind, decl.declares = "structural", "declaration", [{"name": "Model"}]
+    prune_declares([decl], {"alpha.Other"})
+    assert (decl.tier, decl.reason) == ("unverifiable", "not-declared")
+
+
+@pytest.mark.parametrize("packages", [[NPM], [PYPI], [NPM, PYPI], [PYPI, NPM]])
+def test_every_unverifiable_snippet_has_a_reason_and_nothing_else_does(cfg, packages):
+    ex = extract([_page("https://d.io/a", CORPUS)], packages, cfg, log=lambda *_: None)
+    for s in ex.snippets:
+        assert (s.tier == "unverifiable") == bool(s.reason), (s.lang, s.code, s.tier, s.reason)
+        assert not s.reason or s.reason in REASONS
+
+
+def test_the_log_names_what_was_not_checked_and_which_languages_lack_a_checker(cfg):
+    lines = []
+    extract([_page("https://d.io/a", CORPUS)], [NPM], cfg, log=lines.append)
+    [gap] = [ln for ln in lines if "not checked:" in ln]
+    assert gap.startswith("  not checked: ")
+    assert "2 not code" in gap and "no checker (rust 1, swift 1)" in gap
+
+
+def test_nothing_unverifiable_logs_no_gap_line():
+    s = _snip("js", "")
+    s.tier = "structural"
+    assert not_checked_line([s]) == ""

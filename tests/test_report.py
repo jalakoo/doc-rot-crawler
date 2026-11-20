@@ -90,6 +90,69 @@ def test_a_page_nothing_ran_against_is_unverified_not_clean():
     assert r["stats"]["drifted"] == 0 and r["stats"]["findings"] == 0
 
 
+# -------------------------------------------------------------------- coverage
+
+def _coverage_report(snips, pages=None):
+    v = [Release(label="1.0", released_at="2026-01-01")]
+    t = Target(package="alpha", import_name="alpha", releases=v, versions=v)
+    pages = pages or [Page(url="https://d.io/x/a", path="/x/a", title="A", origin="https://d.io"),
+                      Page(url="https://d.io/x/b", path="/x/b", title="B", origin="https://d.io")]
+    results = [Result(id=s.id, page=s.page, version="1.0", status="unverified", package="alpha")
+               for s in snips if s.tier == "unverifiable"]
+    ex = Extraction(package="alpha", import_name="alpha", pages=pages, snippets=snips)
+    return build_report(ex, results, [t], ["https://d.io"], [], "llms.txt", 1.0)
+
+
+def _unchecked(id_, page, lang, reason, code="x"):
+    return Snippet(id=id_, page=page, lang=lang, code=code, package="alpha",
+                   tier="unverifiable", reason=reason)
+
+
+def test_the_report_counts_what_was_not_checked_by_reason_and_language():
+    a, b = "https://d.io/x/a", "https://d.io/x/b"
+    snips = [_unchecked("1", a, "rust", "no-checker"), _unchecked("2", a, "rust", "no-checker"),
+             _unchecked("3", a, "go", "no-checker"), _unchecked("4", b, "cypher", "not-code"),
+             Snippet(id="5", page=b, lang="python", code="import alpha", package="alpha")]
+    cov = _coverage_report(snips)["coverage"]
+    assert cov["tiers"] == {"execute": 0, "structural": 1, "unverifiable": 4}
+    assert cov["unverifiable"] == {"no-checker": 3, "not-code": 1}
+    assert cov["no_checker"] == {"rust": 2, "go": 1}
+    assert cov["labels"]["no-checker"] == "no checker"
+    assert cov["pages"][a]["unverifiable"] == {"no-checker": 3}
+    assert cov["pages"][b]["tiers"]["structural"] == 1 and cov["pages"][b]["no_checker"] == {}
+
+
+def test_a_page_of_one_missing_language_names_it_in_the_description():
+    a, b = "https://d.io/x/a", "https://d.io/x/b"
+    snips = [_unchecked(str(i), a, "rust", "no-checker") for i in range(17)]
+    snips += [_unchecked("m1", b, "rust", "no-checker"), _unchecked("m2", b, "cypher", "not-code")]
+    r = _coverage_report(snips)
+    by_name = {p["name"]: p for s in r["sections"] for p in s["pages"]}
+    [one] = by_name["A"]["findings"]
+    assert one["kind"] == "unverified"
+    assert one["desc"].startswith("17 Rust snippets - docrot has no Rust checker yet")
+    [mixed] = by_name["B"]["findings"]
+    assert "no Rust checker" not in mixed["desc"] and "unverifiable" in mixed["desc"]
+
+
+def test_a_page_of_config_says_it_is_not_code():
+    a = "https://d.io/x/a"
+    r = _coverage_report([_unchecked("1", a, "yaml", "not-code")])
+    desc = next(p for s in r["sections"] for p in s["pages"] if p["name"] == "A")["findings"][0]["desc"]
+    assert "not code docrot can check" in desc
+
+
+def test_an_old_report_without_coverage_still_exports():
+    from docrot.report import export
+    r = _coverage_report([_unchecked("1", "https://d.io/x/a", "rust", "no-checker")])
+    del r["coverage"]
+    scan = {"id": "s", "name": "n", "docs": [], "repos": []}
+    run = {"id": "r", "at": "", "elapsed": 1}
+    ex = {"snippets": [], "pages": []}
+    recs = list(export.records(scan, run, r, ex, [], include_clean=True))
+    assert recs[0]["type"] == "scan" and "coverage" not in recs[0]["stats"]
+
+
 # ----------------------------------------------------------------- npm findings
 NPM_V = [Release(label="1.0.0", released_at="2026-01-01"), Release(label="2.0.0", released_at="2026-06-01")]
 NPM_FINDING = {
