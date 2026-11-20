@@ -244,3 +244,138 @@ def test_no_rewrite_means_no_second_attempt(tmp_path, monkeypatch):
     with pytest.raises(repo.CloneError):
         repo.clone("https://github.com/o/r", log=lambda *_: None)
     assert not any(kw["env"].get("GIT_CONFIG_GLOBAL") == os.devnull for _, kw in FakeGit.calls)
+
+
+# ----------------------------------------------------------------------- npm
+
+def _write(root, rel, text):
+    f = root / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text)
+
+
+def _npm_tree(tmp_path):
+    root = tmp_path / "momentic"
+    _write(root, "package.json", '{"name": "momentic"}')
+    _write(root, "src/index.ts", "export function run() {}\nexport class Client { go() {} }\n"
+                                 "export default function main() {}\n")
+    _write(root, "src/server.js", "exports.start = () => {}\n")
+    _write(root, "src/types.d.ts", "export interface Config { a: number }\n")
+    _write(root, "src/index.test.ts", "export const fromTest = 1\n")
+    _write(root, "src/__tests__/x.ts", "export const fromTestDir = 1\n")
+    _write(root, "src/vendor.min.js", "exports.minified = 1\n")
+    _write(root, "src/huge.js", "exports.huge = 1\n" + "// pad\n" * 80_000)
+    _write(root, "node_modules/dep/index.js", "exports.dep = 1\n")
+    _write(root, "dist/index.js", "exports.built = 1\n")
+    _write(root, "test/fixtures/a.js", "exports.fixture = 1\n")
+    return root
+
+
+def test_npm_symbols_come_from_sources_and_skip_everything_else(tmp_path):
+    syms = symbols_at_head(_npm_tree(tmp_path), "momentic", "npm")
+    assert syms == {"run", "Client", "Client.go", "start", "Config"}  # no `default`, no tests, no bundles
+
+
+def test_npm_symbols_without_src_read_the_root_and_never_raise(tmp_path):
+    root = tmp_path / "flat"
+    _write(root, "package.json", '{"name": "flat"}')
+    _write(root, "index.js", "module.exports = { alpha() {}, beta: 1 }\n")
+    _write(root, "node_modules/x/index.js", "exports.no = 1\n")
+    assert symbols_at_head(root, "flat", "npm") == {"alpha", "beta"}
+    assert symbols_at_head(tmp_path / "missing", "x", "npm") == set()
+
+
+def _workspace(tmp_path):
+    root = tmp_path / "momentic-mono"
+    _write(root, "package.json", '{"name": "monorepo-root", "private": true, '
+                                 '"workspaces": ["packages/*", "tools/*"]}')
+    _write(root, "packages/wizard/package.json", '{"name": "@momentic/wizard"}')
+    _write(root, "packages/cli/package.json", '{"name": "momentic"}')
+    _write(root, "packages/internal/package.json", '{"name": "internal", "private": true}')
+    _write(root, "tools/gen/package.json", '{"name": "gen-tool"}')
+    return root
+
+
+def test_find_package_prefers_a_workspace_member_over_a_private_root(tmp_path):
+    from docrot.acquire.repo import find_package
+    root = _workspace(tmp_path)
+    assert find_package(root, hint="momentic") == ("momentic", "momentic", "npm", root / "packages/cli")
+    assert find_package(root, hint="wizard")[:3] == ("@momentic/wizard", "@momentic/wizard", "npm")
+    assert find_package(root, hint="momentic-mono", want="gen-tool")[3] == root / "tools/gen"
+    assert find_package(root, hint="momentic", want="@momentic/wizard")[0] == "@momentic/wizard"
+    # nothing matches: what it always did
+    assert find_package(root, hint="other")[0] == "monorepo-root"
+
+
+def test_find_package_for_a_plain_npm_repo_is_unchanged(tmp_path):
+    from docrot.acquire.repo import find_package
+    root = _npm_tree(tmp_path)
+    assert find_package(root, hint="momentic") == ("momentic", "momentic", "npm", root)
+    private = tmp_path / "p"
+    _write(private, "package.json", '{"name": "app", "private": true}')
+    assert find_package(private, hint="other")[0] == "app"
+
+
+def _npm_origin(tmp_path):
+    origin = tmp_path / "momentic"
+    _write(origin, "package.json", '{"name": "momentic"}')
+    _write(origin, "README.md", "# Momentic\n")
+    _write(origin, "src/index.ts", "export function run() {}\n")
+    _write(origin, "node_modules/dep/index.js", "exports.dep = 1\n")
+    _write(origin, "dist/index.js", "exports.built = 1\n")
+    _write(origin, "dist/README.md", "# built docs\n")
+    _write(origin, "app.min.js", "exports.m = 1\n")
+    _git("init", "-q", "-b", "main", cwd=origin)
+    _git("add", "-f", ".", cwd=origin)
+    _git("commit", "-qm", "one", cwd=origin)
+    return origin
+
+
+def test_ensure_sources_widens_a_cache_clone_once(tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    url = f"file://{_npm_origin(tmp_path)}"
+    path, _, _ = repo.clone(url, log=lambda *_: None)
+    assert not (path / "src/index.ts").exists()               # clone alone fetches no JS
+    assert symbols_at_head(path, "momentic", "npm") == set()
+
+    assert repo.ensure_sources(path, "npm", log=lambda *_: None) is True
+    assert (path / "src/index.ts").exists()
+    assert (path / "dist/README.md").exists()                 # docs are never excluded
+    assert not (path / "node_modules").exists() and not (path / "dist/index.js").exists()
+    assert not (path / "app.min.js").exists()
+    assert symbols_at_head(path, "momentic", "npm") == {"run"}
+
+    calls = []
+    real = repo._run_git
+    monkeypatch.setattr(repo, "_run_git", lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+    assert repo.ensure_sources(path / "src", "npm", log=lambda *_: None) is True    # idempotent
+    assert calls == []
+
+    path2, _, _ = repo.clone(url, log=lambda *_: None)         # a refresh keeps them
+    assert path2 == path and (path / "src/index.ts").exists()
+
+
+def test_ensure_sources_leaves_other_ecosystems_and_local_paths_alone(tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    origin = _npm_origin(tmp_path)
+    path, _, _ = repo.clone(f"file://{origin}", log=lambda *_: None)
+    assert repo.ensure_sources(path, "pypi") is False
+    assert repo.ensure_sources(path, "nuget") is False
+    assert not (path / "src/index.ts").exists()
+    assert repo.ensure_sources(origin, "npm") is False         # the user's own tree
+    assert repo.ensure_sources(tmp_path / "nowhere", "npm") is False
+
+
+def test_a_failed_widening_is_logged_not_raised(tmp_path, monkeypatch):
+    import docrot.acquire.repo as repo
+    monkeypatch.setattr(repo, "CACHE", tmp_path / "cache")
+    path, _, _ = repo.clone(f"file://{_npm_origin(tmp_path)}", log=lambda *_: None)
+
+    def boom(*a, **k):
+        raise repo.CloneError("git sparse-checkout of x timed out after 1s")
+    monkeypatch.setattr(repo, "_run_git", boom)
+    said = []
+    assert repo.ensure_sources(path, "npm", log=said.append) is False
+    assert "timed out" in said[0]

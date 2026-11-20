@@ -53,10 +53,22 @@ def _walk(tokens):
             yield from _walk(kids)
 
 
+# What only JavaScript writes. Checked before Python so a block that opens with
+# `import x from 'y'` is not read as Python (the `import ` rule below would take
+# it): `from` after a name, a quoted module, `const x =` and `require('` are
+# none of them valid Python, and Python has no line that begins like them.
+_JS_SIGNS = re.compile(
+    r"^\s*import\s+(?:type\s+)?[\w*${},\s]+\s+from\s+['\"]|^\s*import\s+['\"]|"
+    r"\brequire\(\s*['\"]|^\s*(?:export\s+)?(?:const|let|var)\s+[\w${\[]+[^=\n]*=|"
+    r"\bconsole\.log\(", re.M)
+
+
 def _sniff(code: str) -> str:
+    if _JS_SIGNS.search(code):
+        return "javascript"
     if re.search(r"^\s*(import |from \w+ import|def |class )", code, re.M):
         return "python"
-    if re.search(r"^\s*(pip|npm|uv|git|curl|export|docker)\b", code, re.M):
+    if re.search(r"^\s*(pip|npm|npx|pnpm|uv|git|curl|export|docker)\b", code, re.M):
         return "bash"
     if code.lstrip().startswith(("{", "[")):
         return "json"

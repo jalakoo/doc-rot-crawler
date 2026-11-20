@@ -52,6 +52,23 @@ test("checkSources trims, de-duplicates and indexes problems", () => {
   assert.match(L.checkSources(["  "], []).errors[0], /at least one/);
 });
 
+test("alignPackages keeps positions and appends repo-less packages", () => {
+  // blank middle package keeps its slot
+  assert.deepEqual(L.alignPackages(["r1", "r2", "r3"], ["a", "", "c"], []), ["a", "", "c"]);
+  // trailing blanks are trimmed, and nothing at all gives an empty list
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["a", " "], []), ["a"]);
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", ""], ["  "]), []);
+  // repo-less packages follow the aligned ones, even past a blank slot
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", "b"], ["c"]), ["", "b", "c"]);
+  assert.deepEqual(L.alignPackages(["r1", "r2"], ["", ""], ["c"]), ["", "", "c"]);
+  // a package on a blank repo row moves to the tail instead of shifting later rows
+  assert.deepEqual(L.alignPackages(["r1", "", "r3"], ["a", "orphan", "c"], ["d"]), ["a", "c", "orphan", "d"]);
+  // a duplicate repo is dropped as checkSources does, so slots still match its repos
+  assert.deepEqual(L.alignPackages(["r1", "r1", "r2"], ["a", "x", "b"], []), ["a", "b", "x"]);
+  // no repos: just the bare packages, de-duplicated
+  assert.deepEqual(L.alignPackages(["", ""], ["", ""], ["p", "p", " q "]), ["p", "q"]);
+});
+
 test("cardState", () => {
   assert.equal(L.cardState(scan()), "new");
   assert.equal(L.cardState(scan({ runs: [run("2026-09-01T00:00:00", 2)] })), "rot");

@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config as cfgmod
-from .store import ScanOptions, ScanRecord, Store
+from .store import ScanOptions, ScanRecord, Store, align_packages
 
 console = Console()
 
@@ -60,7 +60,7 @@ def scan(args) -> int:
             rec = store.create(docs, repos, name=args.name or "",
                                packages=args.package or [], options=options)
         else:
-            changes: dict = {"options": options, "packages": args.package or rec.packages}
+            changes: dict = {"options": options, "packages": align_packages(repos, args.package) or rec.packages}
             if args.name:
                 changes["name"] = args.name
             rec = store.update(rec.id, **changes)
@@ -230,10 +230,12 @@ def parser() -> argparse.ArgumentParser:
                    help="git URL or local path; repeat or list several. Every "
                         "docs site is checked against every repo's package")
     s.add_argument("--package", action="extend", nargs="+", metavar="NAME",
-                   help="distribution name, by position with --repo (inferred "
-                        "from each repo when omitted)")
+                   help="package name, by position with --repo (inferred from each "
+                        "repo when omitted); names past the last repo need no repo")
     s.add_argument("--name", help="dashboard name for this scan")
-    s.add_argument("--ecosystem", default="pypi", choices=["pypi", "npm"])
+    s.add_argument("--ecosystem", default="pypi", choices=["pypi", "npm", "nuget"],
+                   help="registry for a --package with no repo or whose repo has no package "
+                        "metadata (a repo that has it says for itself)")
     s.add_argument("--versions", type=int, default=3)
     s.add_argument("--max-pages", type=int, help="per docs site")
     s.add_argument("--no-cache", action="store_true")

@@ -159,6 +159,11 @@ def fix_hint(f: dict, actual: str, blocked_by: str | None = None) -> str:
         pin = f.get("doc_stamp", "").split(" · ")[0]
         latest = f.get("code_stamp", "").split(" · ")[0]
         return f"Update the pinned version {pin} to the current release {latest}, or say why the older pin is required."
+    if label == "needs newer release":
+        return ("The example uses API added in a later release. Say which release it needs, "
+                "or keep an example for readers on older versions.")
+    if label == "signature changed":
+        return f"Update the call to the current signature: {actual.strip()}."
     if kind == "signature" and label == "wrong import path":
         return f"Change the import to the symbol's current location: {actual.strip()}."
     if kind == "signature" and label == "kwarg renamed":

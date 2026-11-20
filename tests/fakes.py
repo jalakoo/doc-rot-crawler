@@ -6,12 +6,22 @@ the dashboard renders without Daytona, OpenRouter or a docs site.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from docrot.models import Extraction, Page, Release, Result, Snippet, Target
 from docrot.report import build_report
 from docrot.scan import ScanInputs, ScanOutcome
+
+
+def run_async(coro):
+    """asyncio.run on its own thread: the Playwright suite leaves an event loop
+    running on the main thread, and asyncio.run refuses to nest."""
+    with ThreadPoolExecutor(1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
 
 VERSIONS = [Release(label="1.0.0", released_at="2026-03-01"),
             Release(label="1.1.0", released_at="2026-06-01"),

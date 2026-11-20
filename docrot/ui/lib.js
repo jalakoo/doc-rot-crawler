@@ -88,6 +88,27 @@
     return { docs: docs, repos: repos, errors: errors, invalid: invalid };
   }
 
+  /* The positional `packages` list that goes with checkSources' repos:
+     packages[i] names the package for repos[i] (blank keeps the slot), then
+     packages with no repo follow. A package typed on a blank or duplicate repo
+     row can't keep its slot, so it moves to the repo-less tail. Trailing blanks
+     are dropped; repeated names are kept once. */
+  function alignPackages(reposRaw, pkgsRaw, extraRaw) {
+    var seen = [], aligned = [], tail = [];
+    function clean(v) { return String(v || "").trim(); }
+    reposRaw.forEach(function (raw, i) {
+      var repo = clean(raw), pkg = clean(pkgsRaw[i]);
+      if (repo && seen.indexOf(repo) < 0) { seen.push(repo); aligned.push(pkg); }
+      else if (pkg) tail.push(pkg);
+    });
+    (extraRaw || []).forEach(function (raw) { if (clean(raw)) tail.push(clean(raw)); });
+    var named = aligned.filter(Boolean);
+    tail = tail.filter(function (p, i) { return tail.indexOf(p) === i && named.indexOf(p) < 0; });
+    var out = aligned.concat(tail);
+    while (out.length && !out[out.length - 1]) out.pop();
+    return out;
+  }
+
   function defaultName(docs, repos) {
     return docs.length ? shortSrc(docs[0]) : repos.length ? repoName(repos[0]) : "";
   }
@@ -215,6 +236,7 @@
     PHASES: PHASES, STATE_LBL: STATE_LBL, esc: esc, isHttp: isHttp, hostOf: hostOf,
     shortSrc: shortSrc, repoName: repoName, fmtAbs: fmtAbs, fmtAgo: fmtAgo, plural: plural,
     andList: andList, isDocsUrl: isDocsUrl, isRepo: isRepo, checkSources: checkSources,
+    alignPackages: alignPackages,
     defaultName: defaultName, lastRun: lastRun, cardState: cardState,
     findingsDelta: findingsDelta, activityAt: activityAt, sortScans: sortScans,
     fleetTotals: fleetTotals, pageBarCells: pageBarCells, normalizeReport: normalizeReport,

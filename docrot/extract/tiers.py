@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from ..models import Snippet, Tier
+from . import csharp, javascript
 from .completeness import classify
 
 PLACEHOLDER = re.compile(
@@ -24,20 +25,34 @@ PROSE_LANGS = {"text", "mermaid", "diff", "json", "yaml", "yml", "toml",
 
 def assign(snippets: list[Snippet], available_creds: set[str],
            import_name: str | list[str] = "",
-           assume_credentialed: bool = False) -> None:
+           assume_credentialed: bool = False,
+           npm_packages: list[str] | None = None) -> None:
+    """`npm_packages` names the scan's npm packages. Without it JS/TS is
+    `unverifiable` and shell is judged by its pip lines alone, as before."""
     names = [import_name] if isinstance(import_name, str) else list(import_name)
+    npm = [n for n in (npm_packages or []) if n]
     for s in snippets:
-        s.tier = _tier(s, available_creds, names, assume_credentialed)
+        s.tier = _tier(s, available_creds, names, assume_credentialed, npm)
 
 
 def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
-          assume_credentialed: bool = False) -> Tier:
+          assume_credentialed: bool = False, npm_names: list[str] | None = None) -> Tier:
     import_names = [n for n in (import_names or []) if n]
+    npm = [n for n in (npm_names or []) if n]
     if s.lang in PROSE_LANGS:
         return "unverifiable"
 
-    if s.lang in ("bash", "sh", "shell", "console"):
-        return "execute" if _pure_install(s.code) else "unverifiable"
+    if s.lang in ("bash", "sh", "shell", "console") or (npm and s.lang == "zsh"):
+        return _shell_tier(s.code, npm)
+
+    if npm and javascript.is_js(s.lang):
+        return _js_tier(s, creds, npm, assume_credentialed)
+
+    if csharp.is_csharp(s.lang):
+        # Compiled, never run: the .NET lane checks every C# snippet against
+        # each release with the compiler.
+        s.kind, s.declares = csharp.classify(s.code)
+        return "unverifiable" if s.kind == "fragment" else "structural"
 
     if s.lang not in ("python", "py", "python3"):
         return "unverifiable"
@@ -77,9 +92,63 @@ def _tier(s: Snippet, creds: set[str], import_names: list[str] | None = None,
 
 
 def _touches(s: Snippet, import_name: str) -> bool:
-    if any(sym.split(".")[0] == import_name for sym in s.symbols):
+    # not `sym.split(".")[0]`: npm names hold dots (`socket.io`) and a subpath
+    # is a `/` (`momentic/server.start`), so the root is a prefix, not a segment
+    if any(sym == import_name or sym.startswith((import_name + ".", import_name + "/"))
+           for sym in s.symbols):
         return True
     return bool(re.search(rf"\b(?:import|from)\s+{re.escape(import_name)}\b", s.code))
+
+
+def _shell_tier(code: str, npm: list[str]) -> Tier:
+    """Shell: install blocks run, CLI invocations are probed, the rest is skipped.
+
+    Installing the scan's own packages tells us the documented install works.
+    Installing anything else says nothing about these docs, and running a
+    documented command is never safe, so the lane asks the CLI's own `--help`
+    instead (`structural`).
+    """
+    if npm:
+        installed = {pkg for pkg, _ in javascript.installs(code)}
+        if installed and installed <= set(npm) and javascript.pure_install(code):
+            return "execute"
+        if javascript.invocations(code, npm):
+            return "structural"
+    return "execute" if _pure_install(code) else "unverifiable"
+
+
+# JS cannot be parsed here, so "runs on its own" is argued from what is absent.
+# Network needs the service behind it, and a browser global has no browser to
+# run in; either would fail for reasons that say nothing about the documentation.
+JS_NETWORK = re.compile(
+    r"\b(fetch\s*\(|axios\b|https?\.(?:request|get)\s*\(|XMLHttpRequest\b|new\s+WebSocket\b)|\.listen\s*\(")
+BROWSER = re.compile(r"(?<![\w$.])(document|window|localStorage|sessionStorage|navigator)\s*\.")
+# `</div>`, `<Foo />`, `<>`: a TS generic (`Array<string>`, `<T>(x)`) has none of these
+JSX = re.compile(r"</[A-Za-z>]|<[A-Za-z][\w.]*(?:\s[^<>]*)?/>|<>")
+JSX_LANGS = {"jsx", "tsx"}
+
+
+def _js_tier(s: Snippet, creds: set[str], npm: list[str], assume_credentialed: bool) -> Tier:
+    """A JS/TS snippet is `structural` when it takes anything from a target
+    package, `unverifiable` when it takes nothing (no import of ours to check).
+    It earns `execute` only when it looks like a whole program needing nothing
+    we lack; where unsure the answer is `structural`."""
+    uses = [u for u in javascript.uses(s.code) if javascript.package_of(u.specifier) in npm]
+    if not uses:
+        return "unverifiable"
+    code = javascript.mask(s.code)       # a `<div>` or `fetch(` inside a string is not markup or a call
+    if s.lang.lower() in JSX_LANGS or JSX.search(code) or BROWSER.search(code):
+        return "structural"
+    if all(u.type_only for u in uses):
+        return "structural"              # types are erased: there is nothing to run
+    needed = set(CREDS.findall(s.code))
+    if PLACEHOLDER.search(s.code) or needed or JS_NETWORK.search(code):
+        return "execute" if (needed and needed.issubset(creds)) else "structural"
+    # same blanket rule as Python: a snippet driving the package usually needs
+    # the service behind it, with credentials read inside the library
+    if not creds and not assume_credentialed:
+        return "structural"
+    return "execute"
 
 
 # A shell snippet only earns the `execute` tier when every line installs named

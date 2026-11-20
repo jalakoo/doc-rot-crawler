@@ -19,11 +19,24 @@ from .pins import find_pins
 
 MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+\.md)\)")
 LOC = re.compile(r"<loc>([^<]+)</loc>")
+SECTION_URL = re.compile(r"https?://[^\s)\]\"'<>]+")
 
 
 def _root(url: str) -> str:
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}"
+
+
+def _index_urls(root: str, docs_url: str, name: str) -> list[str]:
+    """Where an index file may live: under the docs path first, then host root.
+
+    momentic.ai/docs serves its real llms.txt / llms-full.txt / sitemap.xml
+    under /docs; the host-root copies describe the marketing site and blog.
+    A docs URL at the host root yields one candidate, so nothing is fetched twice.
+    """
+    base = docs_url.rstrip("/")
+    urls = [f"{base}/{name}", f"{root}/{name}"]
+    return list(dict.fromkeys(urls))
 
 
 def _title(text: str, fallback: str) -> str:
@@ -71,44 +84,68 @@ def _tag(pages: list[Page], origin: str) -> list[Page]:
 # ----------------------------------------------------------------- strategies
 
 async def _llms_full(root, docs_url, prefix, f, max_pages, log):
-    code, text = await f.get(root + "/llms-full.txt")
-    if code != 200 or len(text) < 2000:
-        return [], ""
-    log(f"  llms-full.txt 200 ({len(text)//1024} KB)")
+    for index in _index_urls(root, docs_url, "llms-full.txt"):
+        code, text = await f.get(index)
+        if code != 200 or len(text) < 2000:
+            continue
+        pages = _sections(index, text, prefix)
+        note = f"{len(pages)} pages" if pages else f"0 sections under {prefix or '/'}"
+        log(f"  llms-full.txt 200 ({len(text)//1024} KB) - {note}")
+        if pages:
+            return pages, "llms-full.txt"
+    return [], ""
+
+
+def _is_index(url: str) -> bool:
+    return urlparse(url).path.rsplit("/", 1)[-1] in ("llms.txt", "llms-full.txt")
+
+
+def _sections(index: str, text: str, prefix: str) -> list[Page]:
     chunks = re.split(r"\n(?=#\s+\S)", text)
     pages = []
     for i, chunk in enumerate(chunks):
         if len(chunk.strip()) < 80:
             continue
-        url = f"{root}/llms-full.txt#section-{i}"
-        m = re.search(r"https?://\S+", chunk)
+        url = f"{index}#section-{i}"
+        # A section names its page in its heading (`# [Title](url)`) or just
+        # under it (`Source: url`). A URL further down belongs to the page's
+        # content - a code sample's `https://localhost:5001` - not its address.
+        m = SECTION_URL.search("\n".join(chunk.lstrip().splitlines()[:4]))
         if m:
             url = m.group(0).rstrip(").,")
         if prefix and prefix not in url:
             continue
+        if _is_index(url):
+            # The file's own preamble ("this file is very large - see llms.txt")
+            # names the index as its address. It is no page; its prose and the
+            # commands in it are instructions for agents reading the file.
+            continue
         pages.append(_page(url, chunk))
-    return pages, "llms-full.txt"
+    return pages
 
 
 async def _llms_txt(root, docs_url, prefix, f, max_pages, log):
-    code, text = await f.get(root + "/llms.txt")
-    if code != 200:
-        return [], ""
-    links = [(t, u) for t, u in MD_LINK.findall(text)]
-    if prefix:
-        links = [(t, u) for t, u in links if prefix in u]
-    if not links:
-        return [], ""
-    log(f"  llms.txt 200 - {len(links)} pages indexed")
-    pages: list[Page] = []
-    for title, url in links[:max_pages]:
-        c, body = await f.get(url)
-        if c != 200:
+    for index in _index_urls(root, docs_url, "llms.txt"):
+        code, text = await f.get(index)
+        if code != 200:
             continue
-        p = _page(url.removesuffix(".md"), body)
-        p.title = title or p.title
-        pages.append(p)
-    return pages, "llms.txt + per-page .md"
+        links = [(t, u) for t, u in MD_LINK.findall(text)]
+        if prefix:
+            links = [(t, u) for t, u in links if prefix in u]
+        if not links:
+            log(f"  llms.txt 200 at {index} - 0 .md links under {prefix or '/'}")
+            continue
+        log(f"  llms.txt 200 - {len(links)} pages indexed")
+        pages: list[Page] = []
+        for title, url in links[:max_pages]:
+            c, body = await f.get(url)
+            if c != 200:
+                continue
+            p = _page(url.removesuffix(".md"), body)
+            p.title = title or p.title
+            pages.append(p)
+        return pages, "llms.txt + per-page .md"
+    return [], ""
 
 
 async def _per_page_md(root, docs_url, prefix, f, max_pages, log):
@@ -127,22 +164,27 @@ async def _per_page_md(root, docs_url, prefix, f, max_pages, log):
         if c != 200:
             continue
         pages.append(_page(url, body))
-        for href in re.findall(r"\]\((/[^)\s#]+)\)", body):
-            nxt = root + href
+        # Links are root-relative or absolute: momentic.ai/docs.md links to its
+        # 23 children absolutely, so a root-relative-only match stopped at 1 page.
+        for href in re.findall(r"\]\(((?:/|" + re.escape(root) + r"/)[^)\s#]*)\)", body):
+            nxt = (root + href if href.startswith("/") else href).removesuffix(".md")
             if nxt not in seen and (not prefix or prefix in nxt):
                 queue.append(nxt)
     return pages, "per-page .md"
 
 
 async def _sitemap(root, docs_url, prefix, f, max_pages, log):
-    code, text = await f.get(root + "/sitemap.xml")
-    if code != 200 or "<loc>" not in text:
-        return [], ""
-    urls = [u for u in LOC.findall(text) if not prefix or prefix in u]
-    if not urls:
-        return [], ""
-    log(f"  sitemap.xml 200 - {len(urls)} URLs")
-    return await _fetch_html(urls[:max_pages], f), "sitemap.xml"
+    for index in _index_urls(root, docs_url, "sitemap.xml"):
+        code, text = await f.get(index)
+        if code != 200 or "<loc>" not in text:
+            continue
+        urls = [u for u in LOC.findall(text) if not prefix or prefix in u]
+        if not urls:
+            log(f"  sitemap.xml 200 at {index} - 0 URLs under {prefix or '/'}")
+            continue
+        log(f"  sitemap.xml 200 - {len(urls)} URLs")
+        return await _fetch_html(urls[:max_pages], f), "sitemap.xml"
+    return [], ""
 
 
 async def _search_index(root, docs_url, prefix, f, max_pages, log):

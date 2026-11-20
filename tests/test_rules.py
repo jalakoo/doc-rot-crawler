@@ -13,10 +13,11 @@ import textwrap
 
 import pytest
 
-from docrot.acquire.site import _to_text
+from docrot.acquire.site import _per_page_md, _to_text, acquire_site
 from docrot.extract import claims, completeness, fences, symbols, tiers
 from docrot.models import Page, Snippet
 from docrot.verify.probe import MARKER, _kwargs_used, batched_script, build_targets, parse_batched
+from tests.fakes import run_async
 
 
 # ------------------------------------------------------------------ tiers
@@ -250,3 +251,92 @@ def test_page_titles_drop_markdown_link_syntax():
     from docrot.acquire.site import _title
     assert _title("# [Conversion Table](https://pydantic.dev/x)\nbody", "x") == "Conversion Table"
     assert _title("no heading", "fallback") == "fallback"
+
+
+class FakeFetcher:
+    """Serves a url->body dict as 200s, everything else 404; records every GET."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    async def get(self, url):
+        self.calls.append(url)
+        return (200, self.routes[url]) if url in self.routes else (404, "")
+
+    async def ok(self, url):
+        return (await self.get(url))[0] == 200
+
+
+def _acquire(docs_url, routes, max_pages=50):
+    f = FakeFetcher(routes)
+    logs = []
+    pages, how = run_async(acquire_site(docs_url, f, max_pages, log=logs.append))
+    return pages, how, f, logs
+
+
+def _full(host, n=3):
+    return "\n".join(f"# Page {i}\nSource: {host}/{i}\n" + "body text " * 80 for i in range(n))
+
+
+def test_index_under_the_docs_path_is_preferred_over_the_host_root():
+    routes = {
+        "https://x.io/llms-full.txt": _full("https://x.io/docs", 2),
+        "https://x.io/docs/llms-full.txt": _full("https://x.io/docs", 3),
+    }
+    pages, how, f, _ = _acquire("https://x.io/docs", routes)
+    assert how == "llms-full.txt" and len(pages) == 3
+    assert f.calls == ["https://x.io/docs/llms-full.txt"]
+
+
+def test_host_root_index_with_nothing_under_the_prefix_is_skipped():
+    routes = {
+        "https://x.io/llms-full.txt": _full("https://x.io/blog", 4),
+        "https://x.io/llms.txt": "# x\n[B](https://x.io/blog/b.md)\n",
+        "https://x.io/docs/sitemap.xml": "<loc>https://x.io/docs/a</loc><loc>https://x.io/docs/b</loc>",
+        "https://x.io/docs/a": "<html><title>A</title><body><p>hello</p></body></html>",
+        "https://x.io/docs/b": "<html><title>B</title><body><p>hello</p></body></html>",
+    }
+    pages, how, _, logs = _acquire("https://x.io/docs", routes)
+    assert how == "sitemap.xml" and len(pages) == 2
+    assert any("llms-full.txt 200" in m and "0 sections under /docs" in m for m in logs)
+
+
+def test_per_page_md_follows_absolute_same_host_links_under_the_prefix():
+    routes = {
+        "https://x.io/docs.md": "# Docs\n[A](https://x.io/docs/a) [B](/docs/b)\n"
+                                "[Out](https://x.io/blog/c) [Ext](https://other.io/docs/d)",
+        "https://x.io/docs/a.md": "# A",
+        "https://x.io/docs/b.md": "# B",
+        "https://x.io/blog/c.md": "# C",
+    }
+    f = FakeFetcher(routes)
+    pages, _ = run_async(_per_page_md("https://x.io", "https://x.io/docs", "/docs",
+                                        f, 10, lambda m: None))
+    assert sorted(p.url for p in pages) == [
+        "https://x.io/docs", "https://x.io/docs/a", "https://x.io/docs/b"]
+
+
+def test_per_page_md_respects_max_pages():
+    routes = {"https://x.io/docs.md": "[A](https://x.io/docs/a) [B](https://x.io/docs/b)",
+              "https://x.io/docs/a.md": "# A", "https://x.io/docs/b.md": "# B"}
+    pages, _ = run_async(_per_page_md("https://x.io", "https://x.io/docs", "/docs",
+                                        FakeFetcher(routes), 2, lambda m: None))
+    assert len(pages) == 2
+
+
+def test_docs_url_at_the_host_root_requests_each_index_once():
+    _, _, f, _ = _acquire("https://x.io", {})
+    probes = [u for u in f.calls if u.endswith(("llms-full.txt", "llms.txt", "sitemap.xml"))]
+    assert len(probes) == len(set(probes)) == 3
+
+
+def test_the_llms_full_preamble_is_not_a_page():
+    """momentic's llms-full.txt opens with a heading and a blockquote that names
+    llms.txt as its index; that section is not a docs page."""
+    from docrot.acquire.site import _sections
+    preamble = ("# Momentic\n\n> This file is very large and may be truncated. For an index, see "
+                "https://momentic.ai/docs/llms.txt instead.\n\n> Agent notes for tools reading the file.\n")
+    page = ("# [Run tests](https://momentic.ai/docs/cli/run)\n\nRun the suite with `npx momentic run`. "
+            "More prose so the section is long enough to count as a page.\n")
+    pages = _sections("https://momentic.ai/docs/llms-full.txt", preamble + "\n" + page, "/docs")
+    assert [p.url for p in pages] == ["https://momentic.ai/docs/cli/run"]

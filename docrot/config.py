@@ -6,10 +6,13 @@ Nothing here reaches out to the network. Every optional integration exposes an
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from . import settings
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -27,19 +30,19 @@ DEFAULT_EXTRACTION_MODELS = [
 ]
 
 
-def _models(name: str, default: list[str]) -> list[str]:
+def _models(env: Mapping[str, str], name: str, default: list[str]) -> list[str]:
     """Comma-separated model ids, in preference order.
 
     `EXTRACTION_MODELS=anthropic/claude-opus-5,openai/gpt-sol-latest` selects a
     primary plus one fallback. Empty or unset falls back to the default list.
     """
-    raw = os.environ.get(name) or os.environ.get("EXTRACTION_MODEL", "")
+    raw = env.get(name) or env.get("EXTRACTION_MODEL", "")
     picked = [m.strip() for m in raw.split(",") if m.strip()]
     return picked or list(default)
 
 
-def _int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+def _int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = env.get(name)
     try:
         return int(raw) if raw else default
     except ValueError:
@@ -76,6 +79,9 @@ class Config:
     install_timeout: int = 180
     probe_timeout: int = 180    # one batched probe exec per version
     clone_timeout: int = 600    # per git step; clones are sparse and blobless
+    build_timeout: int = 900    # one `dotnet build` of every C# snippet per version
+    dotnet_image: str = ""      # sandbox image for NuGet packages; "" is the .NET SDK
+    node_image: str = ""        # sandbox image for npm packages; "" is Daytona's default snapshot
     user_agent: str = "docrot/0.1 (+https://github.com/your-org/docrot)"
 
     # --- credentials forwarded into sandboxes (prefix stripped) ---
@@ -106,35 +112,48 @@ class Config:
         return vals
 
 
-def load(env_file: str | Path | None = None) -> Config:
+def base_env(env_file: str | Path | None = None) -> dict[str, str]:
+    """The shell environment with `.env` laid over it - everything except what
+    the dashboard's settings page saved."""
     load_dotenv(env_file or ROOT.parent / ".env", override=False)
     load_dotenv(ROOT / ".env", override=True)
+    return dict(os.environ)
+
+
+def load(env_file: str | Path | None = None) -> Config:
+    # Settings saved from the dashboard live in the OS keychain and win over
+    # `.env`. They are read on every load, so the next scan picks them up.
+    env = base_env(env_file)
+    env.update(settings.overrides())
 
     sandbox_env = {
         k[len(SANDBOX_ENV_PREFIX):]: v
-        for k, v in os.environ.items()
+        for k, v in env.items()
         if k.startswith(SANDBOX_ENV_PREFIX) and v
     }
 
     cfg = Config(
-        daytona_api_key=os.environ.get("DAYTONA_API_KEY", ""),
-        daytona_api_url=os.environ.get("DAYTONA_API_URL", ""),
-        daytona_target=os.environ.get("DAYTONA_TARGET", ""),
-        neo4j_uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
-        neo4j_user=os.environ.get("NEO4J_USERNAME", "neo4j"),
-        neo4j_password=os.environ.get("NEO4J_PASSWORD", "docrotlocal"),
-        neo4j_database=os.environ.get("NEO4J_DATABASE", "neo4j"),
-        extraction_api_key=os.environ.get("EXTRACTION_API_KEY", ""),
-        extraction_base_url=os.environ.get(
+        daytona_api_key=env.get("DAYTONA_API_KEY", ""),
+        daytona_api_url=env.get("DAYTONA_API_URL", ""),
+        daytona_target=env.get("DAYTONA_TARGET", ""),
+        neo4j_uri=env.get("NEO4J_URI", "bolt://localhost:7687"),
+        neo4j_user=env.get("NEO4J_USERNAME", "neo4j"),
+        neo4j_password=env.get("NEO4J_PASSWORD", "docrotlocal"),
+        neo4j_database=env.get("NEO4J_DATABASE", "neo4j"),
+        extraction_api_key=env.get("EXTRACTION_API_KEY", ""),
+        extraction_base_url=env.get(
             "EXTRACTION_BASE_URL", "https://openrouter.ai/api/v1"),
-        extraction_models=_models("EXTRACTION_MODELS", DEFAULT_EXTRACTION_MODELS),
-        max_pages=_int("DOCROT_MAX_PAGES", 60),
-        concurrency=_int("DOCROT_CONCURRENCY", 8),
-        snippet_timeout=_int("DOCROT_SNIPPET_TIMEOUT", 45),
-        install_timeout=_int("DOCROT_INSTALL_TIMEOUT", 180),
-        probe_timeout=_int("DOCROT_PROBE_TIMEOUT", 180),
-        clone_timeout=_int("DOCROT_CLONE_TIMEOUT", 600),
-        user_agent=os.environ.get("DOCROT_USER_AGENT", Config.user_agent),
+        extraction_models=_models(env, "EXTRACTION_MODELS", DEFAULT_EXTRACTION_MODELS),
+        max_pages=_int(env, "DOCROT_MAX_PAGES", 60),
+        concurrency=_int(env, "DOCROT_CONCURRENCY", 8),
+        snippet_timeout=_int(env, "DOCROT_SNIPPET_TIMEOUT", 45),
+        install_timeout=_int(env, "DOCROT_INSTALL_TIMEOUT", 180),
+        probe_timeout=_int(env, "DOCROT_PROBE_TIMEOUT", 180),
+        clone_timeout=_int(env, "DOCROT_CLONE_TIMEOUT", 600),
+        build_timeout=_int(env, "DOCROT_BUILD_TIMEOUT", 900),
+        dotnet_image=env.get("DOCROT_DOTNET_IMAGE", ""),
+        node_image=env.get("DOCROT_NODE_IMAGE", ""),
+        user_agent=env.get("DOCROT_USER_AGENT", Config.user_agent),
         sandbox_env=sandbox_env,
     )
     CACHE.mkdir(parents=True, exist_ok=True)

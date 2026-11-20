@@ -9,6 +9,8 @@
     GET    /api/scans/{id}/report       the newest report (?run=<id> for another)
     GET    /api/scans/{id}/findings.jsonl   the same run as JSON Lines, for agents
     GET    /api/scans/{id}/findings.sarif   the same run as SARIF 2.1.0, for CI
+    GET    /api/settings                what is configured and where from - never a secret's value
+    PUT    /api/settings                save overrides of `.env` to the OS keychain
 
 Bound to 127.0.0.1: it can start sandboxes and spend API credit on request,
 and it has no authentication. Two guards keep the rest of the web out of it:
@@ -29,6 +31,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import config as cfgmod
+from . import settings
 from .report.ingest import BadExport
 from .store import AlreadyImported, RunSummary, ScanOptions, ScanRecord, ScanStatus, Store
 from .worker import AlreadyActive, ScanWorker
@@ -97,6 +101,11 @@ class CreateScan(BaseModel):
 
 class UpdateScan(BaseModel):
     name: str
+
+
+class SaveSettings(BaseModel):
+    # ENV_NAME -> value; null or "" removes the override and falls back to .env
+    values: dict[str, str | None] = Field(default_factory=dict)
 
 
 def _hostname(value: str) -> str:
@@ -218,6 +227,20 @@ def create_app(store: Store, worker: ScanWorker) -> FastAPI:
     @app.get("/api/scans/{scan_id}/findings.sarif")
     def findings_sarif(scan_id: str, run: str | None = None, include_clean: bool = False):
         return _export(scan_id, run, include_clean, "sarif", "application/sarif+json")
+
+    @app.get("/api/settings")
+    def get_settings():
+        return settings.describe(cfgmod.base_env())
+
+    @app.put("/api/settings")
+    def save_settings(body: SaveSettings):
+        try:
+            settings.save(body.values)
+        except settings.Unavailable as e:
+            raise HTTPException(503, [str(e)]) from e
+        except ValueError as e:
+            raise HTTPException(422, e.args[0]) from e
+        return settings.describe(cfgmod.base_env())
 
     @app.get("/", include_in_schema=False)
     def index():

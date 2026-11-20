@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<div class="shell">
+<div class="shell" id="shellMain">
 
   <!-- =============================================================== LIST -->
   <div class="view" id="viewList">
@@ -31,6 +31,7 @@
         <div class="toolbar">
           <p>Open a scan to see its drift, or click <b>&#9998;</b> to rename it.</p>
           <span class="toolbar-actions">
+            <a class="btn-ghost" href="#/settings">Settings</a>
             <button class="btn-ghost" type="button" data-import>Import</button>
             <button class="btn-torch" type="button" data-new>+ New scan</button>
           </span>
@@ -207,6 +208,41 @@
   </div>
 </div>
 
+<!-- =========================================================== SETTINGS -->
+<div class="shell" id="viewSettings" hidden>
+  <div class="view">
+    <nav class="panel crumbs" aria-label="Settings">
+      <a class="back" href="#/">&#9664; All scans</a>
+      <h2 class="crumb-name" id="setTitle" tabindex="-1">Settings</h2>
+      <span class="crumb-run" id="setBackend"></span>
+    </nav>
+
+    <p class="banner" id="setProblem" role="alert" hidden></p>
+
+    <form class="view" id="setForm" novalidate autocomplete="off">
+      <section class="panel">
+        <div class="panel-bd">
+          <p class="set-lede">Anything saved here is kept in <b>this computer's keychain</b> and overrides the
+            same option in <b>.env</b>. Leave a box empty to keep using .env. Saved keys are never sent
+            back to this page, and changes apply to the <b>next</b> scan.</p>
+        </div>
+      </section>
+
+      <div class="view" id="setGroups"></div>
+
+      <section class="panel">
+        <div class="panel-bd form">
+          <p class="form-err" id="setErr" role="alert"></p>
+          <div class="form-actions set-actions">
+            <p class="hint" id="setSaved" role="status"></p>
+            <button class="btn-torch" type="submit" id="setSave">Save settings</button>
+          </div>
+        </div>
+      </section>
+    </form>
+  </div>
+</div>
+
 <!-- ========================================================= NEW SCAN -->
 <dialog class="panel dlg" id="dlg" aria-labelledby="dlgTitle">
   <form id="scanForm" novalidate>
@@ -231,6 +267,11 @@
         <button class="add-row" type="button" data-add="repo">+ Add another repo</button>
         <p class="hint">Git URL or local path. Every docs site is checked against the symbols of <b>every</b> repo listed.
           Paste several at once &mdash; one per line.</p>
+        <ol class="src-rows pkg-rows" id="pkgRows"></ol>
+        <button class="add-row" type="button" data-add="pkg">+ Add a package without a repo</button>
+        <p class="hint">Package is optional. Name it when a repo has no package metadata or ships several packages,
+          or to check a published package with no repo. Use the name on the registry chosen under
+          <b>Ecosystem</b> in Scan options.</p>
       </fieldset>
 
       <details class="opts">
@@ -238,7 +279,7 @@
         <div class="opt-grid">
           <div class="opt">
             <label for="fEco">Ecosystem</label>
-            <select class="inp" id="fEco"><option value="pypi">PyPI</option><option value="npm">npm</option></select>
+            <select class="inp" id="fEco"><option value="pypi">PyPI</option><option value="npm">npm</option><option value="nuget">NuGet</option></select>
           </div>
           <div class="opt">
             <label for="fVers">Releases to test</label>

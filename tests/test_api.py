@@ -184,3 +184,17 @@ def test_security_headers(client):
     assert "script-src 'self'" in r.headers["content-security-policy"]
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-frame-options"] == "DENY"
+
+
+def test_package_positions_survive_create(client):
+    body = {**BODY, "packages": ["", "pkg-b", "pkg-c", ""]}
+    r = client.post("/api/scans", json=body)
+    assert r.status_code == 201 and r.json()["packages"] == ["", "pkg-b", "pkg-c"]
+    assert client.get(f"/api/scans/{r.json()['id']}").json()["packages"] == ["", "pkg-b", "pkg-c"]
+    client.worker.join()
+
+
+def test_docs_and_a_bare_package_are_accepted(client):
+    r = client.post("/api/scans", json={"docs": ["https://docs.a.io"], "packages": ["only-pkg"]})
+    assert r.status_code == 201 and r.json()["packages"] == ["only-pkg"]
+    client.worker.join()

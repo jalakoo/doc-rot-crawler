@@ -68,7 +68,7 @@ TRANSIENT_INSTALL = re.compile(
     r"(connection reset|connection aborted|timed? ?out|temporary failure|"
     r"read timed out|proxyerror|incompleteread|502|503|504)", re.I)
 
-QUOTA_ERROR = re.compile(r"(cpu limit exceeded|quota|too many sandboxes)", re.I)
+QUOTA_ERROR = re.compile(r"((cpu|memory|disk) limit exceeded|quota|too many sandboxes)", re.I)
 
 MAX_CONCURRENCY = 8          # account ceiling is 10 CPUs; 8 leaves headroom
 INSTALL_ATTEMPTS = 3         # PyPI connection resets are common enough to matter

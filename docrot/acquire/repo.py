@@ -11,9 +11,12 @@ import shutil
 import signal
 import subprocess
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import CACHE
+from ..extract import javascript
+from ..extract.csharp import NAMESPACE_DECL
 from ..models import Page
 from .pins import find_pins
 
@@ -38,8 +41,19 @@ class CloneError(RuntimeError):
 # and the metadata that names the package. Everything else - test snapshots,
 # images, frontend bundles - is never fetched.
 SPARSE = ("*.py", "*.md", "*.mdx", "*.rst", "pyproject.toml", "setup.cfg",
-          "setup.py", "package.json")
+          "setup.py", "package.json", "*.cs", "*.csproj")
 CLONE_TIMEOUT = 600
+
+# JS/TS sources are fetched only for an npm repo, and only after `find_package`
+# has said so (`ensure_sources`). On every clone they would pull in the
+# frontends of Python repos - the very thing the sparse set exists to avoid.
+JS_EXTS = ("js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx")
+# Whatever a JS repo vendors or builds is never read, and is where the bulk is.
+# Each negation is scoped to JS files, so a README under `dist/` still arrives.
+JS_SKIP_DIRS = ("node_modules", "dist", "build", "out", "coverage")
+JS_SPARSE = (*(f"*.{e}" for e in JS_EXTS),
+             *(f"!**/{d}/**/*.{e}" for d in JS_SKIP_DIRS for e in JS_EXTS),
+             "!*.min.js", "!*.bundle.js")
 
 # Scans run unattended - from the dashboard's worker thread, or a cron job.
 # Git must never stop to ask: a passphrase prompt for an SSH key, or a
@@ -245,7 +259,8 @@ def package_meta(path: Path) -> tuple[str, str, str]:
     return dist, imp, eco
 
 
-def find_package(path: Path, hint: str = "") -> tuple[str, str, str, Path]:
+def find_package(path: Path, hint: str = "", want: str = "",
+                 rank=None) -> tuple[str, str, str, Path]:
     """`package_meta` plus the directory that contains the import package.
 
     Looks at the repo root, then one level down: monorepos keep the package
@@ -254,6 +269,11 @@ def find_package(path: Path, hint: str = "") -> tuple[str, str, str, Path]:
     the repo (`hint`) wins over the root; otherwise the root does. Python
     metadata anywhere wins over a package.json, so a frontend folder is never
     mistaken for the package.
+
+    A .NET repo is searched at any depth, because its packages live in
+    `src/<Name>/<Name>.csproj`, and a monorepo holds many: `want` names the one
+    to verify (`--package`), and otherwise `rank` - a score per package id,
+    in practice how often the docs mention it - picks one.
     """
     bases = [path]
     if path.is_dir():
@@ -277,17 +297,160 @@ def find_package(path: Path, hint: str = "") -> tuple[str, str, str, Path]:
         imp, root = _guess_import(base, dist)
         return dist, imp, "pypi", root
 
-    for base in bases:
-        pj = base / "package.json"
-        if not pj.exists():
+    if path.is_dir():
+        dotnet = nuget_packages(path)
+        if dotnet:
+            pick = next((p for p in dotnet if want and _norm(p.id) == _norm(want)), None) \
+                or next((p for p in dotnet if hint and _norm(p.id) == _norm(hint)), None) \
+                or max(dotnet, key=lambda p: ((rank(p.id) if rank else 0), -len(p.id)))
+            return pick.id, pick.namespace, "nuget", pick.project.parent
+
+    found_npm = _npm_package(path, bases, hint, want)
+    if found_npm:
+        return (found_npm[0], found_npm[0], "npm", found_npm[1])
+    return "", "", "pypi", path
+
+
+def _package_json(directory: Path) -> dict:
+    try:
+        data = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _workspace_members(root: Path, manifest: dict) -> list[tuple[str, Path]]:
+    """(name, dir) of each publishable package a workspace root holds: the
+    `workspaces` globs, plus the `packages/*` and `apps/*` convention."""
+    ws = manifest.get("workspaces")
+    if isinstance(ws, dict):
+        ws = ws.get("packages")
+    patterns = [p for p in (ws if isinstance(ws, list) else []) if isinstance(p, str)
+                and not p.startswith("!")]
+    patterns += ["packages/*", "apps/*"]
+    out: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        try:
+            dirs = sorted(root.glob(pattern.rstrip("/")))
+        except (ValueError, NotImplementedError, OSError):
+            continue
+        for d in dirs:
+            if d in seen or not d.is_dir() or "node_modules" in d.parts:
+                continue
+            seen.add(d)
+            data = _package_json(d)
+            if data.get("name") and not data.get("private"):
+                out.append((data["name"], d))
+    return out
+
+
+def _npm_package(path: Path, bases: list[Path], hint: str, want: str) -> tuple[str, Path] | None:
+    """(name, directory) of the npm package to verify, or None.
+
+    The first package.json at the root or one level down is what a plain repo
+    wants. A workspace root, though, is `"private": true` and named for the
+    monorepo - nothing anyone installs - so when a member matches `want` or the
+    repo's name (`hint`) the member wins. `@momentic/wizard` answers to `wizard`.
+    """
+    roots = [(b, _package_json(b)) for b in bases if (b / "package.json").exists()]
+    roots = [(b, m) for b, m in roots if m.get("name")]
+    if not roots:
+        return None
+
+    def matches(name: str, wanted: str) -> bool:
+        return bool(wanted) and wanted.lower() in (name.lower(), name.rsplit("/", 1)[-1].lower())
+
+    members: list[tuple[str, Path]] = []
+    for base, manifest in roots:
+        members += _workspace_members(base, manifest)
+    named = [(manifest["name"], base) for base, manifest in roots] + members
+    if want and (hit := next((m for m in named if matches(m[0], want)), None)):
+        return hit
+    first_dir, first = roots[0]
+    if first.get("private") and members \
+            and (hit := next((m for m in members if matches(m[0], hint)), None)):
+        return hit
+    return first["name"], first_dir
+
+
+NOT_A_PACKAGE = re.compile(r"(^|[/\\._-])(tests?|testing|samples?|examples?|templates?|benchmarks?|"
+                           r"performance|playground|demo|hosts?|clients|migrations|shared)"
+                           r"($|[/\\._-])", re.I)
+
+
+@dataclass
+class NugetPackage:
+    id: str
+    namespace: str            # the root namespace its code declares
+    project: Path
+
+
+def nuget_packages(path: Path) -> list[NugetPackage]:
+    """Every packable project in a repo: a library outside test, sample and
+    template folders, not marked `<IsPackable>false`. Its id is the PackageId,
+    else the assembly name."""
+    out = []
+    for proj in sorted(path.rglob("*.csproj")):
+        rel = proj.relative_to(path).as_posix()
+        try:
+            xml = proj.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"<IsPackable>\s*false\s*</IsPackable>", xml, re.I) \
+                or re.search(r"<OutputType>\s*(Win)?Exe\s*</OutputType>", xml, re.I):
+            continue
+        if NOT_A_PACKAGE.search(rel.rsplit("/", 1)[0]):
+            continue
+        name = _prop(xml, "PackageId") or _prop(xml, "AssemblyName") or proj.stem
+        if "$(" in name:
+            continue
+        ns = _prop(xml, "RootNamespace")
+        out.append(NugetPackage(name, ns if ns and "$(" not in ns else _declared_root(proj, name),
+                                proj))
+    return out
+
+
+def _declared_root(project: Path, name: str) -> str:
+    """The root namespace as the code spells it. `Duende.BFF` the assembly
+    declares `namespace Duende.Bff.*`, and snippets are attributed to a package
+    by the namespaces they use, so the assembly's casing matches none of them."""
+    for f in project.parent.rglob("*.cs"):
+        if {"obj", "bin"} & set(f.relative_to(project.parent).parts):
             continue
         try:
-            dist = json.loads(pj.read_text(encoding="utf-8")).get("name", "")
-        except Exception:
-            dist = ""
-        if dist:
-            return dist, dist, "npm", base
-    return "", "", "pypi", path
+            head = f.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            continue
+        for ns in NAMESPACE_DECL.findall(head):
+            if ns.lower() == name.lower() or ns.lower().startswith(name.lower() + "."):
+                return ns[:len(name)]
+    return name
+
+
+def _prop(xml: str, name: str) -> str:
+    m = re.search(rf"<{name}>\s*([^<]+?)\s*</{name}>", xml)
+    return m.group(1) if m else ""
+
+
+def dotnet_sources(project: Path) -> list[Path]:
+    """The .cs files a project compiles: its own folder, and the folders of the
+    projects it references in the same repo, transitively. IdentityServer's
+    `Client` and `ApiScope` live in the Storage project it references."""
+    seen: set[Path] = set()
+    queue = [project.resolve()]
+    files: list[Path] = []
+    while queue:
+        proj = queue.pop()
+        if proj in seen or not proj.exists():
+            continue
+        seen.add(proj)
+        files += [f for f in proj.parent.rglob("*.cs")
+                  if not {"obj", "bin"} & set(f.relative_to(proj.parent).parts)]
+        xml = proj.read_text(encoding="utf-8", errors="replace")
+        for ref in re.findall(r'<ProjectReference\s+Include="([^"]+)"', xml):
+            queue.append((proj.parent / ref.replace("\\", "/")).resolve())
+    return files
 
 
 def _norm(name: str) -> str:
@@ -307,12 +470,34 @@ def _guess_import(path: Path, dist: str) -> tuple[str, Path]:
     return candidate, path
 
 
-def symbols_at_head(path: Path, import_name: str) -> set[str]:
+def dotnet_surface(code_root: Path) -> dict:
+    """A .NET package's public API at HEAD, in `extract.csharp.surface` shape."""
+    from ..extract.csharp import surface
+    proj = next(iter(sorted(code_root.glob("*.csproj"))), None)
+    files = dotnet_sources(proj) if proj else list(code_root.rglob("*.cs"))
+    texts = []
+    for f in files:
+        try:
+            texts.append(f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return surface(texts)
+
+
+def symbols_at_head(path: Path, import_name: str, ecosystem: str = "pypi") -> set[str]:
     """Public symbols defined at HEAD, by AST walk.
+
+    For a .NET package, the types and `Type.Member` names its source declares.
+    For an npm package, the names its JS/TS sources export (`npm_symbols`).
 
     Exact and instant, and it cannot hallucinate a function that isn't there -
     which is why the model is never asked for symbols found in code.
     """
+    if ecosystem == "nuget":
+        api = dotnet_surface(path)
+        return set(api["types"]) | {f"{t}.{m}" for t, ms in api["members"].items() for m in ms}
+    if ecosystem == "npm":
+        return npm_symbols(path)
     out: set[str] = set()
     pkg = path / import_name
     root = pkg if pkg.is_dir() else path
@@ -334,3 +519,110 @@ def symbols_at_head(path: Path, import_name: str) -> set[str]:
                            and not sub.name.startswith("_"):
                             out.add(f"{node.name}.{sub.name}")
     return out
+
+
+# Directories whose JS is never the package's own API: dependencies, build
+# output, and the tests and fixtures that import the package like a user would.
+NPM_SKIP_DIRS = frozenset({"node_modules", "dist", "build", "out", "coverage", "test", "tests",
+                           "__tests__", "__mocks__", "fixtures", "__fixtures__", "e2e", "examples",
+                           "example", "docs", "benchmark", "benchmarks", "vendor"})
+NPM_SOURCE = re.compile(r"\.(?:[cm]?[jt]sx?)$")
+NPM_NOT_SOURCE = re.compile(r"\.(?:test|spec|min|bundle|stories)\.|\.config\.[cm]?[jt]s$")
+NPM_MAX_BYTES = 512_000           # past this it is a bundle, not hand-written source
+NPM_MAX_FILES = 3000
+
+
+def npm_symbols(path: Path) -> set[str]:
+    """Names an npm package exports at HEAD: the union of `exports_of` over its
+    JS/TS sources, preferring `src/` when there is one.
+
+    A union rather than the entry point's exports, because re-exports through
+    an index file cannot be followed lexically; a name that is exported
+    anywhere in the package is one a doc is allowed to mention. `default` is
+    dropped: every module has one and none is a name anyone documents.
+    Never raises - a repo that cannot be read has no symbols.
+    """
+    try:
+        src = path / "src"
+        files = _npm_files(src) or _npm_files(path)
+        out: set[str] = set()
+        for f in files:
+            with contextlib.suppress(Exception):
+                out |= javascript.exports_of(f.read_text(encoding="utf-8", errors="replace"))
+        out.discard("default")
+        return out
+    except Exception:
+        return set()
+
+
+def _npm_files(root: Path) -> list[Path]:
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    for here, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in NPM_SKIP_DIRS and not d.startswith("."))
+        for name in sorted(names):
+            if not NPM_SOURCE.search(name) or NPM_NOT_SOURCE.search(name):
+                continue
+            f = Path(here) / name
+            try:
+                if f.stat().st_size > NPM_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            found.append(f)
+            if len(found) >= NPM_MAX_FILES:
+                return found
+    return found
+
+
+def ensure_sources(path: Path, ecosystem: str, log=print, timeout: int = CLONE_TIMEOUT) -> bool:
+    """Make sure an npm repo's JS/TS sources are checked out, before
+    `symbols_at_head`. True when they are there, False when nothing was done
+    or it could not be done.
+
+    `clone` fetches no JS, so a cache clone of an npm repo has none. This widens
+    that one clone's sparse set (`JS_SPARSE`) with `git sparse-checkout add`,
+    through the same git plumbing, timeout and no-prompt handling as `clone`.
+    It is idempotent - a clone already widened is left alone - and works on a
+    cache clone made before this existed. Nothing but `ecosystem == "npm"` and
+    a cache clone is touched: a local path is the user's own tree, complete
+    already, and Python and .NET scans never fetch JS.
+
+    `path` is the clone or any directory inside it (scan passes `code_root`
+    as readily as `clone`'s path). A failure is logged, not raised: the docs
+    were fetched, so the scan goes on with an empty symbol table.
+    """
+    if ecosystem != "npm":
+        return False
+    dest = _cache_clone(path)
+    if dest is None:
+        return False
+    if all(p in _git(dest, "sparse-checkout", "list").splitlines() for p in JS_SPARSE[:len(JS_EXTS)]):
+        return True
+    origin = _git(dest, "remote", "get-url", "origin") or str(dest)
+    for plain in (False, True):
+        try:
+            _run_git(["-C", str(dest), "sparse-checkout", "add", *JS_SPARSE], timeout, origin,
+                     plain=plain)
+            return True
+        except CloneError as e:
+            if not (e.auth and not plain):
+                log(f"  ! could not fetch the JS/TS sources of {repo_name(origin)} ({e})")
+                return False
+    return False
+
+
+def _cache_clone(path: Path) -> Path | None:
+    """The cache clone `path` is, or is inside - None for any other directory."""
+    try:
+        cache = Path(CACHE).resolve()
+        here = path.resolve()
+    except OSError:
+        return None
+    for d in (here, *here.parents):
+        if d == cache or cache not in d.parents:
+            return None
+        if (d / ".git").exists():
+            return d
+    return None

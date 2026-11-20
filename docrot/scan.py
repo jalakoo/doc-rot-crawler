@@ -22,6 +22,15 @@ from . import config as cfgmod
 from .models import Extraction, Release, Result, Target
 from .store import PHASES, ScanOptions, ScanRecord, ScanStatus, Store, now
 
+# Ecosystems whose versions are picked across major/minor lines, not just the
+# newest few. NuGet needs it to find a release old enough to still compile the
+# docs. npm needs it because the busy packages (momentic is past 3.74) cut a
+# release every few days and neighbours are nearly identical - the newest N
+# would all agree, while the newest of each major line is where renamed or
+# removed commands and exports actually show. PyPI keeps the plain newest-N:
+# its docs usually track the current minor.
+SPREAD_ECOSYSTEMS = frozenset({"nuget", "npm"})
+
 Log = Callable[[str], None]
 
 
@@ -77,6 +86,15 @@ def _source_spec(repo: str, commit: str, clone: Path, code_root: Path) -> str:
     return spec if inside in ("", ".") else f"{spec}#subdirectory={inside}"
 
 
+def _import_name(package: str, ecosystem: str, found: str = "") -> str:
+    """What `import`/`require` calls the package. PyPI distributions swap `-` for
+    `_` and NuGet carries its own namespace; an npm package is imported by the
+    very name it is published under."""
+    if ecosystem == "npm":
+        return package
+    return found or package.replace("-", "_")
+
+
 def _short(url: str) -> str:
     p = urlparse(url)
     return (p.netloc + p.path).rstrip("/") if p.netloc else url
@@ -86,11 +104,21 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
                    phase: Callable[[int], None] = lambda i: None) -> ScanOutcome:
     from .acquire import acquire_repo, acquire_site, pick_versions, releases
     from .acquire.http import Fetcher
-    from .acquire.repo import CloneError, clone, find_package, repo_name, symbols_at_head
+    from .acquire.repo import (
+        CloneError,
+        clone,
+        dotnet_surface,
+        ensure_sources,
+        find_package,
+        nuget_packages,
+        repo_name,
+        symbols_at_head,
+    )
     from .extract import extract
     from .graph import GraphStore
     from .report import build_report
-    from .verify import run_matrix
+    from .verify import run_matrix, run_npm_matrix
+    from .verify.dotnet import Surface, run_dotnet_matrix
 
     opts = inp.options
     if opts.extraction_models:
@@ -118,23 +146,46 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
 
     targets: list[Target] = []
     head: dict[str, set[str]] = {}
+    api: dict[str, Surface] = {}               # .NET packages' public API at HEAD
+    clones: list[tuple[str, Path, str, str]] = []
+    corpus = "\n".join(p.text for p in pages)
     multi = len(inp.repos) > 1
     for i, repo in enumerate(inp.repos):
         try:
             path, commit, branch = await asyncio.to_thread(clone, repo, log, cfg.clone_timeout)
         except CloneError as e:
             raise ScanError(f"couldn't fetch {repo}: {e}") from e
-        dist, imp, eco, code_root = find_package(path, hint=repo_name(repo))
-        dist = (inp.packages[i] if i < len(inp.packages) else "") or dist
+        clones.append((repo, path, commit, branch))
+        want = inp.packages[i] if i < len(inp.packages) else ""
+        # A .NET monorepo ships many packages; without --package, verify the
+        # one the docs talk about most.
+        dist, imp, eco, code_root = find_package(path, hint=repo_name(repo), want=want,
+                                                 rank=corpus.count)
+        if eco == "nuget" and not want:
+            others = [p.id for p in nuget_packages(path) if p.id != dist]
+            if others:
+                log(f"  {repo_name(repo)} ships {len(others) + 1} NuGet packages - verifying "
+                    f"{dist}; name others with --package")
+        if want and not dist:
+            # No metadata to say what the repo is, so the user's word and the
+            # chosen ecosystem do; find_package's "pypi" is only its default.
+            eco = opts.ecosystem
+        dist = want or dist
         pages.extend(acquire_repo(path, log, namespace=repo_name(repo) if multi else "",
                                   origin=repo))
         where = f" · {repo_name(repo)}" if multi else ""
         if not dist:
             log(f"  ! no package metadata in {repo_name(repo)} - its docs are read, "
-                "nothing is installed from it")
+                "nothing is verified from it; name its package (the package field, or "
+                "--package) to check the docs against it")
             continue
-        imp = imp or dist.replace("-", "_")
-        syms = symbols_at_head(code_root, imp)
+        imp = _import_name(dist, eco, imp)
+        if eco == "npm":
+            # a cached sparse clone holds only docs until the JS/TS sources are fetched
+            await asyncio.to_thread(ensure_sources, path, eco, log, cfg.clone_timeout)
+        syms = symbols_at_head(code_root, imp, eco)
+        if eco == "nuget":
+            api[dist] = Surface.of(dotnet_surface(code_root))
         log(f"  {len(syms)} public symbols at HEAD ({commit}){where}")
         known = next((t for t in targets if t.package == dist), None)
         if known:
@@ -142,15 +193,32 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
             continue
         targets.append(Target(package=dist, import_name=imp, ecosystem=eco,
                               repo_url=repo, branch=branch, commit=commit,
-                              install_spec=_source_spec(repo, commit, path, code_root)))
+                              install_spec=(_source_spec(repo, commit, path, code_root)
+                                            if eco == "pypi" else "")))
         head[dist] = syms
     for name in inp.packages[len(inp.repos):]:
-        if name and not any(t.package == name for t in targets):
-            targets.append(Target(package=name, import_name=name.replace("-", "_"),
+        if not name or any(t.package == name for t in targets):
+            continue
+        # A further package from a .NET monorepo already cloned keeps its
+        # source at HEAD: `--repo products --package Duende.IdentityServer
+        # Duende.BFF` verifies both.
+        home = next(((r, p, c, b, pkg) for r, p, c, b in clones for pkg in nuget_packages(p)
+                     if pkg.id.lower() == name.lower()), None)
+        if home:
+            repo, _, commit, branch, pkg = home
+            code_root = pkg.project.parent
+            head[name] = symbols_at_head(code_root, pkg.namespace, "nuget")
+            api[name] = Surface.of(dotnet_surface(code_root))
+            targets.append(Target(package=name, import_name=pkg.namespace, ecosystem="nuget",
+                                  repo_url=repo, branch=branch, commit=commit))
+            log(f"  {len(head[name])} public symbols at HEAD ({commit}) · {name}")
+        else:
+            targets.append(Target(package=name, import_name=_import_name(name, opts.ecosystem),
                                   ecosystem=opts.ecosystem))
 
     if not targets:
-        raise ScanError("no package name - pass --package or a repo with package metadata")
+        raise ScanError("no package to verify - name one (the package field beside a repo, "
+                        "or --package on the command line) or use a repo that has package metadata")
     if not pages:
         raise ScanError("no pages acquired")
 
@@ -166,7 +234,8 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
             else:
                 log(f"  ! {t.package} has no releases on {t.ecosystem}, and no repo to install "
                     "from - nothing can be verified")
-        t.versions = pick_versions(t.releases, opts.versions, mentioned) or [Release(label="HEAD")]
+        t.versions = pick_versions(t.releases, opts.versions, mentioned,
+                                   spread=t.ecosystem in SPREAD_ECOSYSTEMS) or [Release(label="HEAD")]
         who = f" · {t.package}" if len(targets) > 1 else ""
         log(f"  {len(t.releases)} releases · testing {', '.join(t.labels)}{who}")
     if mentioned:
@@ -186,9 +255,18 @@ async def run_scan(inp: ScanInputs, cfg: cfgmod.Config, log: Log = print,
         snips = [s for s in ex.snippets if s.package == t.package]
         if not snips:
             continue
-        if t.ecosystem != "pypi":
-            log(f"  ! {t.package}: {t.ecosystem} packages are not installable in the "
-                "sandbox yet - marked unverified")
+        if t.ecosystem == "nuget":
+            if len(targets) > 1:
+                log(f"  {t.package}: {len(snips)} snippets")
+            got = await run_dotnet_matrix(snips, t.package, t.package, t.labels, cfg, log,
+                                          head=api.get(t.package))
+        elif t.ecosystem == "npm":
+            if len(targets) > 1:
+                log(f"  {t.package}: {len(snips)} snippets")
+            got = await run_npm_matrix(snips, t.package, t.labels, cfg, log)
+        elif t.ecosystem != "pypi":
+            log(f"  ! {t.package}: no verification lane for {t.ecosystem} packages yet - "
+                "marked unverified")
             got = [Result(id=s.id, page=s.page, version=v, status="unverified",
                           tier=s.tier) for s in snips for v in t.labels]
         else:

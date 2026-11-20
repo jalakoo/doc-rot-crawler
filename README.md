@@ -8,8 +8,8 @@ listed, and what the docs say beside the traceback the code actually
 produced](images/dashboard.gif)
 
 Above: 153 pages of the Pydantic docs checked against `pydantic` and
-`pydantic-core`, 14 of them carrying drift — here a page still calling
-`model_dump_json` on a v1 model, which now raises `AttributeError`.
+`pydantic-core`, 14 of them carrying drift — here a page whose example calls
+`model_dump_json` on an object that no longer has it, raising `AttributeError`.
 
 - [Run it](#run-it)
 - [How it fits together](#how-it-fits-together)
@@ -46,6 +46,10 @@ docrot scan --docs-url https://docs.perseus.lettria.net \
 docrot scan --name "Pydantic + core" --assume-credentialed \
             --docs-url https://docs.pydantic.dev/latest \
             --repo https://github.com/pydantic/pydantic https://github.com/pydantic/pydantic-core
+docrot scan --name "Duende IdentityServer" --max-pages 1000 \
+            --docs-url https://docs.duendesoftware.com \
+            --repo https://github.com/DuendeSoftware/products \
+            --package Duende.IdentityServer Duende.BFF   # .NET: see below
 docrot scans                  # what's recorded
 docrot diff [--scan ID]       # regressions since the previous run; exit 1 if any (cron)
 docrot blast close_async      # pages that break if a symbol is renamed
@@ -60,9 +64,78 @@ end-of-run sandbox sweep both assume a single scan.
 from docs and repos in, to findings out as JSONL, SARIF, CI annotations and
 agent input](images/architecture-dungeon.png)
 
+### .NET documentation
+
+C# snippets are compiled rather than run. A repo whose `.csproj` files declare
+packages is read as a .NET repo, and each release comes from NuGet. For every
+version tested, one sandbox (`mcr.microsoft.com/dotnet/sdk:10.0`, 2 CPU, 2 GiB)
+installs the package, reflects over its public types and members, and compiles
+every C# snippet with Roslyn. Each snippet is wrapped in its own file first:
+its usings are moved to the top, its types kept as they are, its loose
+statements put in a method whose parameters stand in for the `builder`,
+`services` and `app` that docs never declare.
+
+A compiler error counts as drift only when it concerns the package's own API.
+The snippet, wrapper and SDK are the same in every version, so an error that
+one release raises and another doesn't must come from the package itself.
+`DPoPProofValidatonContext` compiles against 7.4 and not against 8.0, which
+renamed it. An error every release raises is drift only if the repo defines
+that name at HEAD, which means the docs describe unreleased API. Anything else
+a wrapped excerpt trips over (an injected `_userManager` field the page never
+showed, a type from another package) leaves the snippet `unverified`, never
+failed. The finding says which way the versions split. **Behind the latest
+release** is rot. **Requires a newer release** means the page is right for the
+current release but not for older ones.
+
+A .NET monorepo ships many packages. `--package` names the ones to verify,
+several for one `--repo`. Without it, the scan picks the package the docs
+mention most. NuGet versions are picked across major lines (8.0.8, 7.4.12,
+7.3.4) rather than as three patches of one minor, because drift can only be
+seen against a version old enough to compile the stale code.
+
 Credentials come from `.env` (see `.env.sample`): `DAYTONA_API_KEY` to execute,
 `EXTRACTION_API_KEY` for model-extracted claims. Without them a scan still runs,
 marking what it could not check as unverified.
+
+### npm packages and CLIs
+
+JavaScript and TypeScript snippets are checked against the package as published.
+A repo with a `package.json` is read as an npm package (a monorepo's workspaces
+are searched), and each release comes from the npm registry. For every version
+tested, one sandbox (Daytona's default snapshot, which carries Node 24) installs
+the package and checks:
+
+- **imports and exports.** Every module the docs import is loaded and every name
+  they take from it is looked up, including subpaths and the package's shipped
+  `.d.ts` files, so a type-only import is not mistaken for a missing export.
+- **CLI subcommands and flags.** A shell snippet such as `npx momentic run
+  --headless` is checked against the CLI's own `--help`: is `run` a subcommand,
+  and does it list `--headless`.
+- **runnable snippets.** A complete snippet that needs no credentials is
+  syntax-checked and then run.
+
+Documented commands are never executed, only `--help`. A snippet that needs a key,
+the network, a browser or a login is left `unverified` rather than failed, as is
+any CLI whose help says nothing either way. Versions are picked across major
+lines rather than as the newest three: a package like momentic cuts a release
+every few days, and neighbours agree on nearly everything.
+
+A package whose repo holds only docs has no `package.json` to read. Name the
+package, in the dashboard's package field beside the repo or with `--package`,
+and choose npm as the ecosystem:
+
+```bash
+docrot scan --name "Momentic" --docs-url https://momentic.ai/docs \
+            --repo https://github.com/momentic-ai/cli \
+            --package momentic --ecosystem npm --versions 2
+```
+
+The sandbox image can be changed with `DOCROT_NODE_IMAGE` (Node 20 or newer).
+
+Known limits: the package is installed from the npm registry, so one that is
+unpublished, private or only buildable from source is not verified. A CLI that
+needs a login before it prints help is `unverified`, and a snippet that depends
+on files or state the page never shows is not run.
 
 ## How it fits together
 
@@ -89,7 +162,8 @@ The diagram is generated: edit `images/architecture-flowchart.html` and run
 | --- | --- | --- |
 | **Daytona** (`daytona` SDK) | The sandboxes each version is installed into, then introspected or run | Every snippet is `unverified`; the scan finds nothing |
 | **OpenRouter** (`openai` SDK) | Prose claims the lexical pass misses — claims only, never tiers or symbols | Lexical claims only (measured: precision 1.00, recall 0.97) |
-| **PyPI / npm** | Which releases exist and when they shipped | Falls back to `HEAD`, which only installs if the name is published |
+| **PyPI / npm / NuGet** | Which releases exist and when they shipped | Falls back to `HEAD`, which only installs if the name is published |
+| **.NET SDK 10 + Roslyn** (in the sandbox image) | Reflecting a NuGet package's API and compiling C# snippets against it | C# snippets are `unverified` |
 | **git** ≥ 2.27 | Cloning repos: `--depth 1 --filter=blob:none` plus sparse checkout of code, docs and package metadata | No repo docs, no HEAD symbol table |
 | **Neo4j 5** (`neo4j` driver, `docker-compose.yml`) | `docrot blast`, drift traversals; Symbol/Page/Snippet/Version graph | Blast radius falls back to the report's own index |
 | **FastAPI + uvicorn** | The dashboard's API and static files, bound to 127.0.0.1 | CLI only |
@@ -243,6 +317,19 @@ actual behaviour, where to edit, and a `fix_hint`. After the docs are changed,
 re-run the scan from the dashboard or `docrot scan`, and check that the ids are
 gone.
 
+## Settings
+
+The dashboard's **Settings** page (`#/settings`) edits the same options as `.env` - API keys,
+models, the graph store, run tuning and the `SANDBOX_ENV_*` credentials forwarded into sandboxes.
+What you save there is kept in the operating system's keychain (macOS Keychain, Windows Credential
+Locker, or the Secret Service on Linux) as one item, service `docrot`, account `settings`. It is
+never written to a file.
+
+A saved value overrides the same name in `.env`; removing it falls back to `.env`. The CLI reads
+the keychain too, so `docrot scan` and the dashboard agree. Secrets are write-only from the page:
+the server reports whether one is set and where it came from, never its value. Changes apply to
+the next scan.
+
 ## Security
 
 The dashboard binds 127.0.0.1 and has no login, because it can start sandboxes
@@ -255,7 +342,8 @@ Do not put it behind a tunnel or a reverse proxy without adding authentication.
 An imported `.jsonl` or `.sarif` file is untrusted input: its text is rendered
 as markup, so only `<b>` and `<code>` survive and any tag carrying an attribute
 is escaped. Documentation code is only ever executed in a Daytona sandbox,
-never on your machine.
+never on your machine - and so is the NuGet restore and compile of a .NET
+package, whose build targets can run code of their own.
 
 Credentials live in `.env` - `chmod 600` it. `SANDBOX_ENV_*` values are
 forwarded into third-party sandboxes so snippets can run, and everything a

@@ -94,9 +94,12 @@ def build_report(ex: Extraction, results: list[Result], targets: list[Target],
             src = next((s for s in snips_by_page.get(page.url, [])
                         if pin in s.code), None)
             doc_line = src.line if src else 0
-            base = (src.code if src else f"install {t.package}=={pin}").strip()
-            m = PIN_RE.match(base)
+            npm = t.ecosystem == "npm"      # `pkg@1.2.3`, not `pkg==1.2.3`
+            base = (src.code if src else
+                    (f"npm install {t.package}@{pin}" if npm else f"install {t.package}=={pin}")).strip()
+            m = (re.match(rf"(.*?@)({re.escape(pin)})(.*)", base, re.S) if npm else PIN_RE.match(base))
             head, tail = (m.group(1), m.group(3)) if m else (base, "")
+            old_at, new_at = ((pin, latest.label) if npm else (f"=={pin}", f"=={latest.label}"))
             found.append(Finding(
                 kind="stale_pin", label="version pin", line=doc_line,
                 snippet=src.id if src else "",
@@ -112,13 +115,13 @@ def build_report(ex: Extraction, results: list[Result], targets: list[Target],
                 doc_where=f"{page.path} · line {doc_line}" if doc_line else page.path,
                 doc_url=page.url, doc_stamp_label="docs pin",
                 doc_stamp=f"{pin}" + (f" · {match.released_at}" if match else ""),
-                code_where="pyproject.toml / registry",
-                code_url=_code_url(repo_url, branch, "pyproject.toml"),
+                code_where="package.json / registry" if npm else "pyproject.toml / registry",
+                code_url=_code_url(repo_url, branch, "package.json" if npm else "pyproject.toml"),
                 code_stamp_label="current release",
                 code_stamp=f"{latest.label}" +
                            (f" · {latest.released_at}" if latest.released_at else ""),
-                doc_parts=[[head, "same"], [f"=={pin}", "del"], [tail, "same"]],
-                code_parts=[[head, "same"], [f"=={latest.label}", "ins"], [tail, "same"]],
+                doc_parts=[[head, "same"], [old_at, "del"], [tail, "same"]],
+                code_parts=[[head, "same"], [new_at, "ins"], [tail, "same"]],
                 damage="-1 RELEASE", days_behind=gap,
                 evidence=_pin_evidence(t.package, releases, pin, latest),
                 chips=[["tier-struct", "structural"], ["st-drift", "stale pin"],
@@ -213,6 +216,10 @@ def _pin_evidence(pkg, releases, pin, latest) -> str:
 
 def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Target) -> Finding:
     probe = _probe_json(r.stderr)
+    if probe.get("compiler") is not None:
+        return _from_compiler(s, probe, page, failing, labels, repo_url, branch, latest, ex)
+    if probe.get("npm"):          # an empty list is a pass record: fall through
+        return _from_npm(s, probe, page, failing, labels, repo_url, branch, latest, ex)
     fails = probe.get("failed") or []
     blob = "\n".join(fails) if fails else (r.stderr or "")
 
@@ -375,6 +382,180 @@ def _from_failure(s, r, page, failing, labels, repo_url, branch, latest, ex: Tar
     )
 
 
+MISSING_CODES = {"CS0246", "CS0234", "CS1061", "CS0117"}
+
+
+def _from_compiler(s, probe, page, failing, labels, repo_url, branch, latest,
+                   ex: Target) -> Finding:
+    """A C# snippet the compiler rejects, for a reason that is the package's.
+
+    Which way the versions split is the finding. Failing on the latest
+    release while an older one compiles is rot: the docs are behind. Failing
+    only on older releases means the page documents something newer - true,
+    and worth knowing, but the page is right about the current release.
+    """
+    drift = [c for c in probe["compiler"] if c.get("drift")]
+    first = drift[0] if drift else {}
+    code, msg = str(first.get("code", "")), str(first.get("message", ""))
+    line, reason = int(first.get("line") or 0), str(first.get("drift", ""))
+    lines = s.code.split("\n")
+    src = lines[line - 1] if 0 < line <= len(lines) else s.code[:300]
+    passing = [v for v in labels if v not in failing]
+    behind = latest.label in failing
+    everywhere = len(failing) == len(labels)
+    missing = code in MISSING_CODES
+
+    if everywhere:
+        label, title = "never shipped", "DOCUMENTS API NO RELEASE SHIPS"
+        why = (f"No release tested ({', '.join(labels)}) compiles this line. "
+               + ("The repo defines it at HEAD, so the docs are ahead of the "
+                  "latest release." if "HEAD" in reason else ""))
+    elif behind:
+        label = "gone in latest" if missing else "signature changed"
+        title = ("API REMOVED OR RENAMED" if missing else "CALL NO LONGER COMPILES")
+        why = (f"This compiles against {', '.join(passing)} but not "
+               f"{', '.join(failing)}. The docs describe an API the current "
+               "release has changed - a reader copying it gets a compiler error.")
+    else:
+        label, title = "needs newer release", "REQUIRES A NEWER RELEASE"
+        why = (f"This only compiles against {', '.join(passing)}. On "
+               f"{', '.join(failing)} it does not, so the page documents API "
+               "added since - correct for the current release, but readers on "
+               "older versions cannot follow it.")
+
+    return Finding(
+        kind="missing_symbol" if missing else "signature", label=label, title=title,
+        desc=why,
+        page=page.url, doc_where=f"{page.path} · {s.id}" + (f" · line {line}" if line else ""),
+        doc_url=page.url, doc_stamp_label="docs compile on",
+        doc_stamp=", ".join(passing) or "no release tested",
+        code_where=f"C# compiler · {failing[0]}",
+        code_url=_code_url(repo_url, branch, ""),
+        code_stamp_label="code is at",
+        code_stamp=f"{latest.label} · {latest.released_at}",
+        doc_parts=[[src.strip()[:300], "del"]],
+        code_parts=[[f"{code}: {msg}"[:300], "void"]],
+        damage=("-1 SYMBOL" if missing else "-1 SIGNATURE") if behind or everywhere
+               else "NEWER API",
+        days_behind=0,
+        evidence="\n".join(probe.get("failed") or [])[:900],
+        chips=[["tier-struct", "compiled"], ["st-fail", "drift"],
+               ["", f"fails on {len(failing)}/{len(labels)}"]],
+        sprite="wraith" if missing else "mimic",
+    )
+
+# What each npm check kind reads like. (kind, label, damage, sprite, noun)
+_NPM_CHECKS = {
+    "export": ("missing_symbol", "-1 SYMBOL", "wraith", "export"),
+    "module": ("missing_symbol", "-1 MODULE", "wraith", "module path"),
+    "bin": ("missing_symbol", "-1 BIN", "wraith", "CLI"),
+    "command": ("missing_symbol", "-1 COMMAND", "wraith", "command"),
+    "flag": ("signature", "-1 FLAG", "mimic", "flag"),
+    "runtime": ("runtime", "-1 RUN", "slime", "call"),
+}
+
+
+def _npm_url(repo_url: str, package: str, latest) -> str:
+    """The package's repo root, or its page on npm when there is no repo."""
+    if repo_url:
+        return repo_url.rstrip("/").removesuffix(".git")
+    tail = "" if not latest.label or latest.label.startswith("HEAD") else f"/v/{latest.label}"
+    return f"https://www.npmjs.com/package/{package}{tail}"
+
+
+def _npm_title(check: str, scenario: str) -> tuple[str, str]:
+    """(label, title) for a check kind in each cross-version scenario."""
+    if scenario == "newer":
+        return "needs newer release", "REQUIRES A NEWER RELEASE"
+    everywhere = scenario == "everywhere"
+    table = {
+        "export": ("never exported", "DOCUMENTS AN EXPORT NO RELEASE HAS") if everywhere
+        else ("export gone", "EXPORT REMOVED OR RENAMED"),
+        "module": ("never resolved", "DOCUMENTS A MODULE PATH THAT DOES NOT RESOLVE") if everywhere
+        else ("module path gone", "MODULE PATH REMOVED OR MOVED"),
+        "bin": ("no such bin", "DOCUMENTS A CLI THE PACKAGE DOES NOT INSTALL") if everywhere
+        else ("bin gone", "DOCUMENTS A CLI THE PACKAGE NO LONGER INSTALLS"),
+        "command": ("never a command", "DOCUMENTS A COMMAND NO RELEASE HAS") if everywhere
+        else ("command gone", "DOCUMENTS A COMMAND THE CLI NO LONGER HAS"),
+        "flag": ("not in --help", "DOCUMENTS A FLAG THE CLI DOES NOT ACCEPT") if everywhere
+        else ("flag gone", "DOCUMENTS A FLAG THE CLI DOES NOT ACCEPT"),
+        "runtime": ("snippet fails", "SNIPPET FAILS WHEN RUN"),
+    }
+    return table.get(check, table["runtime"])
+
+
+def _from_npm(s, probe, page, failing, labels, repo_url, branch, latest, ex: Target) -> Finding:
+    """An npm snippet the package contradicts: a module that does not resolve,
+    an export that is not there, a CLI command or flag the CLI's own --help
+    does not know, or code that dies when run.
+
+    Which way the versions split is the finding, as for the compiler lane:
+    failing on the latest release while an older one holds is rot; failing only
+    on older releases means the page documents something newer; failing
+    everywhere says nothing was ever true - and for a flag that is stated as
+    "absent from the CLI's own --help", never as "removed".
+    """
+    found = probe["npm"]
+    first = found[0]
+    check = str(first.get("check", "runtime"))
+    kind, damage, sprite, noun = _NPM_CHECKS.get(check, _NPM_CHECKS["runtime"])
+    subject, msg = str(first.get("subject", "")), str(first.get("message", ""))
+    line, detail = int(first.get("line") or 0), str(first.get("detail") or "")
+    lines = s.code.split("\n")
+    src = lines[line - 1] if 0 < line <= len(lines) else s.code[:300]
+    passing = [v for v in labels if v not in failing]
+    behind = latest.label in failing
+    everywhere = len(failing) == len(labels)
+    scenario = "everywhere" if everywhere else "behind" if behind else "newer"
+    label, title = _npm_title(check, scenario)
+
+    cli = check in ("bin", "command", "flag")
+    if everywhere:
+        if check == "flag":
+            why = (f"<b>{subject.rsplit(' ', 1)[-1]}</b> is absent from the CLI's own <b>--help</b> on "
+                   f"every version tested ({', '.join(labels)}). That is the CLI's account of what it "
+                   "accepts: a reader copying this line passes a flag it does not list.")
+        else:
+            why = (f"<b>{subject}</b> was not found in any version tested ({', '.join(labels)}). "
+                   "Documentation that ran ahead of the package, or never matched it - there is no "
+                   "release a reader could install to make this work.")
+    elif behind:
+        why = (f"<b>{subject}</b> is there on {', '.join(passing)} but not on {', '.join(failing)}. "
+               f"The docs describe a {noun} the current release no longer has - a reader following "
+               "this page hits it.")
+    else:
+        why = (f"<b>{subject}</b> only exists on {', '.join(passing)}. On {', '.join(failing)} it does "
+               "not, so the page documents something added since - correct for the current release, "
+               "but readers on older versions cannot follow it.")
+    if len(found) > 1:
+        why += f" {len(found) - 1} more problem(s) in the same snippet."
+
+    words = msg[:300]
+    where = (f"{subject.split(' ')[0]} --help · {failing[0]}" if cli
+             else f"node import · {failing[0]}" if check in ("module", "export")
+             else f"executed in sandbox · {failing[0]}")
+    evidence = "\n".join(probe.get("failed") or [])
+    if detail:
+        evidence += "\n\n" + detail
+    return Finding(
+        kind=kind, label=label, title=title, desc=why,
+        page=page.url, doc_where=f"{page.path} · {s.id}" + (f" · line {line}" if line else ""),
+        doc_url=page.url, doc_stamp_label="docs hold on",
+        doc_stamp=", ".join(passing) or "no release tested",
+        code_where=where, code_url=_npm_url(repo_url, ex.package, latest),
+        code_stamp_label="code is at",
+        code_stamp=f"{latest.label} · {latest.released_at}" if latest.released_at else latest.label,
+        doc_parts=[[src.strip()[:300], "del"]],
+        code_parts=[[words, "void"]],
+        damage=damage if behind or everywhere else "NEWER API", days_behind=0,
+        evidence=evidence.strip()[:900],
+        chips=[["tier-exec" if check == "runtime" else "tier-struct",
+                s.tier if check == "runtime" else ("cli help" if cli else "import probe")],
+               ["st-fail", "drift"], ["", f"fails on {len(failing)}/{len(labels)}"]],
+        sprite=sprite,
+    )
+
+
 def _split_on(code: str, token: str) -> tuple[str, str]:
     i = code.find(token)
     if i < 0:
@@ -406,6 +587,7 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
             sprite="none",
         )
     s = snips[0]
+    npm = ex.ecosystem == "npm"
     if not checked:
         tiers = sorted({x.tier for x in snips})
         return Finding(
@@ -435,15 +617,19 @@ def _clean(page: Page, ex: Target, snips_by_page, latest, repo_url, branch,
         page=page.url, doc_where=f"{page.path} · {len(snips)} snippets",
         doc_url=page.url, doc_stamp_label="docs reflect",
         doc_stamp=f"{latest.label} · current",
-        code_where=f"{ex.import_name} · introspected",
-        code_url=_code_url(repo_url, branch, f"{ex.import_name}/__init__.py"),
+        code_where=f"{ex.package} · installed and probed" if npm else f"{ex.import_name} · introspected",
+        code_url=(_npm_url(repo_url, ex.package, latest) if npm
+                  else _code_url(repo_url, branch, f"{ex.import_name}/__init__.py")),
         code_stamp_label="code is at",
         code_stamp=f"{latest.label} · {latest.released_at}",
         doc_parts=[[s.code[:300], "same"]],
-        code_parts=[["all referenced symbols resolved\nsignatures accept the "
+        code_parts=[[("every module loaded and every export found\nCLI commands and flags "
+                      "appear in the CLI's own --help") if npm else
+                     "all referenced symbols resolved\nsignatures accept the "
                      "documented arguments", "same"]],
         damage="NO DAMAGE", days_behind=0,
-        evidence="probe: all symbols resolved\ndrift: none",
+        evidence=("probe: modules loaded, exports found, CLI help consulted\ndrift: none" if npm
+                  else "probe: all symbols resolved\ndrift: none"),
         chips=[["tier-struct", s.tier], ["st-pass", "no drift"], ["", "clean"]],
         sprite="none",
     )

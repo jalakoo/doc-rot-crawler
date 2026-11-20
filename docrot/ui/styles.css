@@ -561,7 +561,16 @@
   input[type="file"].inp::file-selector-button:hover{background:var(--torch);color:var(--shadow)}
   .src-rows{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-direction:column;gap:6px}
   .src-row{display:flex;align-items:center;gap:6px}
-  .src-row .inp{flex:1}
+  .src-row .inp{flex:1;min-width:0}
+  .src-row .inp.pkg{flex:0 1 38%}
+  .pkg-rows{margin-top:10px}
+  .pkg-rows:empty{display:none}
+  .src-tag.pkg{color:var(--bone-dim)}
+  @media (max-width:520px){
+    .src-row.repo-row{flex-wrap:wrap}
+    .src-row.repo-row .inp{flex:1 1 calc(100% - 100px)}
+    .src-row.repo-row .inp.pkg{flex:1 1 100%;order:3}
+  }
   .rm{
     flex:none;width:34px;height:36px;padding:0;cursor:pointer;
     background:transparent;border:2px solid var(--stone-edge);color:var(--bone-dim);
@@ -606,3 +615,28 @@
   .tl-body .tl-row+.tl-row.tl-head{margin-top:18px}
   .tl-head .hcap:first-child{color:var(--torch)}
   .btn-torch:disabled{opacity:.5;cursor:default;transform:none}
+
+  /* ---------- settings ---------- */
+  .set-lede{margin:0;color:var(--bone-dim);font-size:19px}
+  .set-lede b{color:var(--bone);font-weight:400}
+  .set-note{margin:0 0 13px;color:var(--bone-dim);font-size:18px}
+  .set-rows{display:flex;flex-direction:column;gap:13px}
+  .set-row{display:grid;grid-template-columns:minmax(150px,230px) minmax(0,1fr) auto;gap:4px 12px;align-items:center}
+  .set-row>label{font-size:19px;color:var(--bone)}
+  .set-row>label code,.set-name{display:block;font-family:var(--body);font-size:15px;color:var(--bone-faint);word-break:break-all}
+  .set-row .hint{grid-column:2/-1;margin:0}
+  .set-side{display:flex;align-items:center;gap:8px;min-width:150px;justify-content:flex-end}
+  .set-src{font-family:var(--display);font-size:7px;letter-spacing:.06em;text-transform:uppercase;color:var(--bone-faint);white-space:nowrap}
+  .set-src.keychain{color:var(--torch)}
+  .set-src.env{color:var(--rune)}
+  .set-row.resetting .inp{opacity:.4;text-decoration:line-through}
+  .set-row.resetting .set-src{color:var(--blood-soft)}
+  .set-row .set-new{display:flex;gap:6px;align-items:center}
+  .set-row .set-new span{color:var(--bone-faint);font-size:16px;white-space:nowrap}
+  .set-actions{border-top:0;padding-top:0}
+  .set-actions .hint{color:var(--moss-soft)}
+  @media (max-width:640px){
+    .set-row{grid-template-columns:minmax(0,1fr)}
+    .set-row .hint{grid-column:1}
+    .set-side{justify-content:flex-start}
+  }

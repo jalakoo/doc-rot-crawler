@@ -40,7 +40,7 @@ def now() -> str:
 
 
 class ScanOptions(BaseModel):
-    ecosystem: Literal["pypi", "npm"] = "pypi"
+    ecosystem: Literal["pypi", "npm", "nuget"] = "pypi"
     versions: int = Field(3, ge=1, le=10)
     max_pages: int | None = Field(None, ge=1, le=2000)
     assume_credentialed: bool = False
@@ -129,6 +129,41 @@ def clean_sources(docs: list[str], repos: list[str]) -> tuple[list[str], list[st
     return docs, repos
 
 
+def clean_packages(packages: list[str] | None) -> list[str]:
+    """Trimmed but still positional: packages[i] belongs to repos[i], so a blank
+    in the middle keeps its slot. Only trailing blanks are dropped."""
+    out = [(p or "").strip() for p in packages or []]
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+def align_packages(repos: list[str], packages: list[str] | None) -> list[str]:
+    """`packages` re-sorted to follow `repos` through `clean_sources`.
+
+    packages[i] names repos[i], but de-duplication and blank-dropping shift the
+    repos, so a positional list posted with a duplicate repo would hand every
+    later repo its neighbour's package. The first occurrence of a repo wins; a
+    later duplicate's package is used only when the first had none. Entries past
+    the last repo are repo-less packages and stay at the end.
+    """
+    pkgs = [(p or "").strip() for p in packages or []]
+    slot: dict[str, int] = {}
+    out: list[str] = []
+    for i, raw in enumerate(repos or []):
+        repo = (raw or "").strip()
+        if not repo:
+            continue
+        pkg = pkgs[i] if i < len(pkgs) else ""
+        if repo in slot:
+            if not out[slot[repo]]:
+                out[slot[repo]] = pkg
+            continue
+        slot[repo] = len(out)
+        out.append(pkg)
+    return clean_packages(out + pkgs[len(repos or []):])
+
+
 def default_name(docs: list[str], repos: list[str]) -> str:
     if docs:
         p = urlparse(docs[0])
@@ -198,7 +233,9 @@ class Store:
             # an import carries whatever sources the file names, including none
             docs, repos = [d for d in docs if d], [r for r in repos if r]
             name = clean_name(name or imported_from)
+            packages = clean_packages(packages)
         else:
+            packages = align_packages(repos, packages)
             docs, repos = clean_sources(docs, repos)
             name = clean_name(name) if (name or "").strip() else default_name(docs, repos)
         with self._lock:
@@ -208,7 +245,7 @@ class Store:
                 scan_id = f"{slug}-{secrets.token_hex(3)}"
             rec = ScanRecord(id=scan_id, name=name, docs=docs, repos=repos,
                              imported_from=imported_from,
-                             packages=[p.strip() for p in packages or [] if p.strip()],
+                             packages=packages,
                              options=options or ScanOptions())
             self._write(self._dir(scan_id) / "scan.json", rec.model_dump())
             return rec

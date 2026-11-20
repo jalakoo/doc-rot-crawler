@@ -9,6 +9,7 @@ from docrot.store import (
     ScanOptions,
     ScanStatus,
     Store,
+    clean_packages,
     clean_sources,
     default_name,
     is_docs_url,
@@ -144,3 +145,27 @@ def test_import_legacy_pairs_each_run_with_its_own_report(store, tmp_path):
     got = [(r.id, r.stats["findings"]) for r in store.runs(rec.id)]
     assert got == [("20260912T100500", 2), ("20260912T101000", 3)]
     assert store.import_legacy(runs) is None           # only once
+
+
+def test_packages_stay_aligned_with_repos(store):
+    assert clean_packages(["", " b ", "", "c", " ", ""]) == ["", "b", "", "c"]
+    assert clean_packages(None) == [] and clean_packages(["", " "]) == []
+    rec = store.create(["https://docs.a.io"], ["./a", "./b"], packages=["", "pkg-b", "pkg-c", ""])
+    assert store.get(rec.id).packages == ["", "pkg-b", "pkg-c"]
+
+
+def test_docs_plus_a_bare_package_is_a_valid_scan(store):
+    rec = store.create(["https://docs.a.io"], [], packages=["only-pkg"])
+    got = store.get(rec.id)
+    assert got.repos == [] and got.packages == ["only-pkg"]
+
+
+def test_packages_follow_their_repos_through_de_duplication(store):
+    from docrot.store import align_packages
+    repos = ["./a", "./a", "./b", ""]
+    # the duplicate's package is used only when the first had none
+    assert align_packages(repos, ["pa", "other", "pb", "x", "loose"]) == ["pa", "pb", "loose"]
+    assert align_packages(["./a", "./a", "./b"], ["", "pa", "pb"]) == ["pa", "pb"]
+    rec = store.create(["https://docs.a.io"], ["./a", " ./a ", "./b"], packages=["", "pa", "pb"])
+    assert store.get(rec.id).repos == ["./a", "./b"]
+    assert store.get(rec.id).packages == ["pa", "pb"]

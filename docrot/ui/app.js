@@ -735,15 +735,22 @@
 
   var dlg = $("dlg"), form = $("scanForm");
 
-  function rowsOf(kind) { return Array.prototype.slice.call($(kind + "Rows").querySelectorAll(".inp")); }
+  /* kind: "docs", "repo" (a repo row also carries its package input) or "pkg"
+     (a package with no repo). */
+  function rowsOf(kind) { return Array.prototype.slice.call($(kind + "Rows").querySelectorAll('input[name="' + kind + '"]')); }
+  function repoPackages() {
+    return Array.prototype.map.call($("repoRows").children, function (li) { return li.querySelector('input[name="package"]').value; });
+  }
 
   function addRow(kind, value, focus) {
     var li = document.createElement("li");
-    li.className = "src-row";
+    li.className = "src-row" + (kind === "repo" ? " repo-row" : "");
     li.innerHTML = '<span class="src-tag ' + kind + '" aria-hidden="true">' + kind.toUpperCase() + "</span>" +
       '<input class="inp" type="' + (kind === "docs" ? "url" : "text") + '" name="' + kind +
       '" spellcheck="false" autocomplete="off" placeholder="' +
-      (kind === "docs" ? "https://docs.example.com" : "https://github.com/org/repo") + '">' +
+      (kind === "docs" ? "https://docs.example.com" : kind === "pkg" ? "package name" : "https://github.com/org/repo") + '">' +
+      (kind === "repo" ? '<input class="inp pkg" type="text" name="package" spellcheck="false" autocomplete="off" ' +
+                         'placeholder="package (optional)">' : "") +
       '<button class="rm" type="button" data-rm>&#10005;</button>';
     li.querySelector(".inp").value = value || "";
     $(kind + "Rows").appendChild(li);
@@ -752,18 +759,21 @@
   }
 
   function relabel(kind) {
-    var rows = $(kind + "Rows").children, noun = kind === "docs" ? "Docs URL" : "Repository";
+    var rows = $(kind + "Rows").children,
+        noun = kind === "docs" ? "Docs URL" : kind === "pkg" ? "Package without a repo" : "Repository";
     Array.prototype.forEach.call(rows, function (li, i) {
       li.querySelector(".inp").setAttribute("aria-label", noun + " " + (i + 1));
+      var pk = li.querySelector('input[name="package"]');
+      if (pk) pk.setAttribute("aria-label", "Package for repository " + (i + 1));
       var rm = li.querySelector(".rm");
       rm.setAttribute("aria-label", "Remove " + noun.toLowerCase() + " " + (i + 1));
-      rm.disabled = rows.length === 1;
+      rm.disabled = kind !== "pkg" && rows.length === 1;
     });
   }
 
   function openDialog() {
     form.reset();
-    $("docsRows").innerHTML = ""; $("repoRows").innerHTML = "";
+    $("docsRows").innerHTML = ""; $("repoRows").innerHTML = ""; $("pkgRows").innerHTML = "";
     addRow("docs"); addRow("repo");
     $("formErr").textContent = "";
     form.querySelector(".opts").open = false;
@@ -777,17 +787,18 @@
     if (add) { addRow(add.getAttribute("data-add"), "", true); return; }
     var rm = e.target.closest("[data-rm]");
     if (rm && !rm.disabled) {
-      var li = rm.parentNode, list = li.parentNode, kind = list.id === "docsRows" ? "docs" : "repo";
+      var li = rm.parentNode, list = li.parentNode, kind = list.id.replace(/Rows$/, "");
       var next = li.nextElementSibling || li.previousElementSibling;
       list.removeChild(li);
       relabel(kind);
       if (next) next.querySelector(".inp").focus();
+      else if (kind === "pkg") form.querySelector('[data-add="pkg"]').focus();
     }
   });
 
   form.addEventListener("paste", function (e) {
     var inp = e.target;
-    if (!inp.matches(".src-row .inp")) return;
+    if (!inp.matches(".src-row .inp") || inp.name === "package") return;
     var parts = (e.clipboardData || window.clipboardData).getData("text").split(/[\s,]+/).filter(Boolean);
     if (parts.length < 2) return;
     e.preventDefault();
@@ -810,6 +821,8 @@
     var docInputs = rowsOf("docs"), repoInputs = rowsOf("repo");
     var checked = L.checkSources(docInputs.map(function (i) { return i.value; }),
                                  repoInputs.map(function (i) { return i.value; }));
+    var pkgInputs = rowsOf("pkg"), packages = L.alignPackages(
+      repoInputs.map(function (i) { return i.value; }), repoPackages(), pkgInputs.map(function (i) { return i.value; }));
     docInputs.concat(repoInputs).forEach(function (i) { i.value = i.value.trim(); i.removeAttribute("aria-invalid"); });
     checked.invalid.docs.forEach(function (i) { docInputs[i].setAttribute("aria-invalid", "true"); });
     checked.invalid.repos.forEach(function (i) { repoInputs[i].setAttribute("aria-invalid", "true"); });
@@ -821,7 +834,7 @@
     var maxPages = parseInt($("fMax").value, 10);
     var body = {
       name: $("fName").value.trim(),
-      docs: checked.docs, repos: checked.repos,
+      docs: checked.docs, repos: checked.repos, packages: packages,
       options: {
         ecosystem: $("fEco").value,
         versions: parseInt($("fVers").value, 10) || 3,
@@ -894,9 +907,166 @@
   $("importCancel").addEventListener("click", function () { importDlg.close(); });
   importDlg.addEventListener("click", function (e) { if (e.target === importDlg) importDlg.close(); });
 
+  /* ============================================================ settings */
+
+  var SRC_LBL = { keychain: "keychain", env: ".env", "default": "default" };
+  var SANDBOX_NOTE = "Keys forwarded into sandboxes, so snippets that name them run for real instead " +
+    "of only being probed. A snippet sees the name without the SANDBOX_ENV_ prefix. " +
+    "Use scoped, revocable keys.";
+  var setForm = $("setForm");
+
+  function setRow(o) {
+    // o: key, labelHTML, secret, kind, source, value, placeholder, hint
+    var id = "set-" + o.key, mine = o.source === "keychain";
+    return '<div class="set-row" data-row="' + esc(o.key) + '">' +
+      '<label for="' + esc(id) + '">' + o.labelHTML + "</label>" +
+      '<input class="inp" id="' + esc(id) + '" data-key="' + esc(o.key) + '" data-was="' + esc(o.value || "") +
+      '" type="' + (o.secret ? "password" : o.kind === "int" ? "number" : "text") + '"' +
+      (o.kind === "int" ? ' min="1" inputmode="numeric"' : "") +
+      ' spellcheck="false" autocomplete="' + (o.secret ? "new-password" : "off") + '" value="' +
+      esc(o.value || "") + '" placeholder="' + esc(o.placeholder) + '">' +
+      '<span class="set-side"><span class="set-src ' + esc(o.source) + '">' + esc(SRC_LBL[o.source]) + "</span>" +
+      (mine ? '<button class="btn-ghost" type="button" data-reset="' + esc(o.key) +
+              '" aria-pressed="false">Remove</button>' : "") + "</span>" +
+      (o.hint ? '<p class="hint">' + esc(o.hint) + "</p>" : "") + "</div>";
+  }
+
+  function secretHint(source) {
+    return source === "keychain" ? "saved in keychain - type to replace"
+         : source === "env" ? "set in .env - type to override" : "not set";
+  }
+
+  function fieldRow(f) {
+    return setRow({
+      key: f.key, secret: f.secret, kind: f.kind, source: f.source, value: f.value, hint: f.hint,
+      labelHTML: esc(f.label) + "<code>" + esc(f.key) + "</code>",
+      placeholder: f.secret ? secretHint(f.source) : (f.fallback || "not set")
+    });
+  }
+
+  function sandboxRow(c) {
+    return setRow({
+      key: c.key, secret: true, source: c.source, value: "",
+      labelHTML: esc(c.name) + "<code>" + esc(c.key) + "</code>", placeholder: secretHint(c.source)
+    });
+  }
+
+  function newCredRow() {
+    var n = setForm.querySelectorAll("[data-new-cred]").length + 1;
+    var div = document.createElement("div");
+    div.className = "set-row";
+    div.setAttribute("data-new-cred", "");
+    div.innerHTML =
+      '<span class="set-new"><span>SANDBOX_ENV_</span><input class="inp" type="text" data-cred-name ' +
+      'spellcheck="false" autocomplete="off" placeholder="OPENAI_API_KEY" aria-label="New credential ' + n + ' name"></span>' +
+      '<input class="inp" type="password" data-cred-value autocomplete="new-password" placeholder="value" ' +
+      'aria-label="New credential ' + n + ' value">' +
+      '<span class="set-side"><button class="rm" type="button" data-drop aria-label="Discard new credential ' + n + '">&#10005;</button></span>';
+    $("setCreds").appendChild(div);
+    div.querySelector("[data-cred-name]").focus();
+  }
+
+  function renderSettings(data) {
+    $("setBackend").textContent = data.available ? "stored in " + data.backend : "";
+    $("setProblem").hidden = data.available;
+    $("setProblem").textContent = data.available ? ""
+      : "Settings cannot be saved here: " + data.problem + ". Options from .env still apply.";
+    $("setSave").disabled = !data.available;
+
+    var html = data.groups.map(function (g) {
+      var rows = data.fields.filter(function (f) { return f.group === g.id; }).map(fieldRow).join("");
+      var panel = '<section class="panel"><h2 class="panel-hd">' + esc(g.title) + '</h2><div class="panel-bd">' +
+        '<p class="set-note">' + esc(g.note) + '</p><div class="set-rows">' + rows + "</div></div></section>";
+      if (g.id !== "sandbox") return panel;
+      return panel + '<section class="panel"><h2 class="panel-hd">Sandbox credentials' +
+        '<span class="hd-note">SANDBOX_ENV_*</span></h2><div class="panel-bd">' +
+        '<p class="set-note">' + esc(SANDBOX_NOTE) + '</p><div class="set-rows" id="setCreds">' +
+        data.sandbox.map(sandboxRow).join("") + "</div>" +
+        '<button class="add-row" type="button" data-add-cred style="margin-top:13px">+ Add a credential</button>' +
+        "</div></section>";
+    }).join("");
+    $("setGroups").innerHTML = html;
+    if (!data.available) {
+      Array.prototype.forEach.call(setForm.querySelectorAll("input, #setGroups button"),
+                                   function (el) { el.disabled = true; });
+    }
+  }
+
+  function loadSettings() {
+    $("setErr").textContent = ""; $("setSaved").textContent = "";
+    return api("GET", "/api/settings").then(renderSettings).catch(function (err) {
+      $("setErr").innerHTML = err.messages.map(esc).join("<br>");
+    });
+  }
+
+  setForm.addEventListener("click", function (e) {
+    if (e.target.closest("[data-add-cred]")) return newCredRow();
+    var drop = e.target.closest("[data-drop]");
+    if (drop) { var gone = drop.closest(".set-row"); gone.parentNode.removeChild(gone); return; }
+    var reset = e.target.closest("[data-reset]");
+    if (!reset) return;
+    var row = reset.closest(".set-row"), inp = row.querySelector(".inp");
+    var on = !row.classList.contains("resetting");
+    row.classList.toggle("resetting", on);
+    reset.setAttribute("aria-pressed", String(on));
+    reset.textContent = on ? "Undo" : "Remove";
+    inp.disabled = on;
+    row.querySelector(".set-src").textContent = on ? "removed on save" : SRC_LBL.keychain;
+  });
+
+  setForm.addEventListener("input", function () { $("setSaved").textContent = ""; });
+
+  setForm.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var values = {}, errors = [];
+    Array.prototype.forEach.call(setForm.querySelectorAll("[data-key]"), function (inp) {
+      var key = inp.getAttribute("data-key"), v = inp.value.trim(), was = inp.getAttribute("data-was");
+      if (inp.closest(".set-row").classList.contains("resetting")) values[key] = null;
+      else if (inp.type === "password") { if (v) values[key] = v; }      // empty = leave as it is
+      else if (v !== was) values[key] = v || null;                       // emptied = back to .env
+    });
+    Array.prototype.forEach.call(setForm.querySelectorAll("[data-new-cred]"), function (row) {
+      var name = row.querySelector("[data-cred-name]"), value = row.querySelector("[data-cred-value]");
+      var n = name.value.trim().toUpperCase().replace(/^SANDBOX_ENV_/, ""), v = value.value.trim();
+      name.removeAttribute("aria-invalid"); value.removeAttribute("aria-invalid");
+      if (!n && !v) return;
+      if (!/^[A-Z][A-Z0-9_]*$/.test(n)) {
+        name.setAttribute("aria-invalid", "true");
+        errors.push("A credential name is capitals, digits and underscores, e.g. OPENAI_API_KEY.");
+      } else if (!v) {
+        value.setAttribute("aria-invalid", "true");
+        errors.push(n + " needs a value.");
+      } else values["SANDBOX_ENV_" + n] = v;
+    });
+    $("setErr").innerHTML = errors.map(esc).join("<br>");
+    if (errors.length) { setForm.querySelector('[aria-invalid="true"]').focus(); return; }
+    if (!Object.keys(values).length) { $("setSaved").textContent = "Nothing to save."; return; }
+
+    $("setSave").disabled = true;
+    api("PUT", "/api/settings", { values: values }).then(function (data) {
+      renderSettings(data);
+      $("setSaved").textContent = "Saved to the keychain. The next scan uses it.";
+      announce("Settings saved.");
+    }).catch(function (err) {
+      $("setSave").disabled = false;
+      $("setErr").innerHTML = err.messages.map(esc).join("<br>");
+    });
+  });
+
   /* ============================================================== router */
 
   function route() {
+    var onSettings = /^#\/settings\b/.test(location.hash);
+    $("viewSettings").hidden = !onSettings;
+    $("shellMain").hidden = onSettings;
+    if (onSettings) {
+      current = null;
+      document.title = "Settings · Doc Rot Crawler";
+      loadSettings();
+      window.scrollTo(0, 0);
+      $("setTitle").focus({ preventScroll: true });
+      return;
+    }
     var m = location.hash.match(/^#\/scan\/([\w-]+)/), s = m && byId(m[1]);
     if (s) {
       current = s.id;

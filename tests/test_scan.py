@@ -2,9 +2,6 @@
 sandboxes and the graph."""
 from __future__ import annotations
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
 import pytest
 
 from docrot import scan as scanmod
@@ -12,13 +9,7 @@ from docrot.models import Page, Release, Result
 from docrot.scan import ScanError, ScanInputs, execute_scan, run_scan
 from docrot.store import PHASES, ScanOptions
 from tests.fakes import fake_runner
-
-
-def run(coro):
-    """asyncio.run on its own thread: the Playwright suite leaves an event loop
-    running on the main thread, and asyncio.run refuses to nest."""
-    with ThreadPoolExecutor(1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+from tests.fakes import run_async as run
 
 
 @pytest.fixture
@@ -85,7 +76,7 @@ def test_run_scan_multi_source(offline, cfg):
 
 
 def test_run_scan_needs_a_package(offline, cfg):
-    with pytest.raises(ScanError, match="no package name"):
+    with pytest.raises(ScanError, match="no package to verify"):
         run(run_scan(ScanInputs(docs=["https://a.io"]), cfg, lambda m: None))
 
 
@@ -95,14 +86,106 @@ def test_run_scan_docs_only_with_explicit_package(offline, cfg):
     assert out.report["package"] == "alpha"
 
 
-def test_npm_targets_are_not_sent_to_the_sandbox(offline, cfg, monkeypatch):
+def _as_npm(monkeypatch):
+    """Make every cloned repo look like an npm package, and record the npm lane."""
+    import docrot.acquire.repo as repo
+    import docrot.verify as verify
+    real = repo.find_package
+    monkeypatch.setattr(repo, "find_package", lambda p, **kw: (*real(p)[:2], "npm", real(p)[3]))
+    monkeypatch.setattr(repo, "ensure_sources", lambda *a, **kw: True)
+    npm_calls = []
+
+    async def run_npm_matrix(snips, package, versions, cfg, log):
+        npm_calls.append((package, len(snips), versions))
+        return [Result(id=s.id, page=s.page, version=v, status="pass") for s in snips for v in versions]
+
+    monkeypatch.setattr(verify, "run_npm_matrix", run_npm_matrix)
+    return npm_calls
+
+
+def test_npm_targets_go_to_the_npm_lane(offline, cfg, monkeypatch):
+    npm_calls = _as_npm(monkeypatch)
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/alpha"]),
+                       cfg, lambda m: None))
+    assert offline["matrix"] == []                      # not the pip lane
+    assert [(p, n) for p, n, _ in npm_calls] == [("alpha", 2)]
+    assert {r.status for r in out.results} == {"pass"}
+
+
+def test_npm_sources_are_widened_before_reading_symbols(offline, cfg, monkeypatch):
+    import docrot.acquire.repo as repo
+    _as_npm(monkeypatch)
+    order = []
+    monkeypatch.setattr(repo, "ensure_sources", lambda path, eco, log, timeout: order.append(("ensure", eco, timeout)))
+    real = repo.symbols_at_head
+    monkeypatch.setattr(repo, "symbols_at_head", lambda *a: order.append(("symbols",)) or real(*a))
+    run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/alpha"]),
+                 cfg, lambda m: None))
+    assert order[0] == ("ensure", "npm", cfg.clone_timeout) and ("symbols",) in order
+
+
+def test_an_ecosystem_with_no_lane_stays_unverified(offline, cfg, monkeypatch):
     import docrot.acquire.repo as repo
     real = repo.find_package
-    monkeypatch.setattr(repo, "find_package", lambda p, hint="": (*real(p)[:2], "npm", real(p)[3]))
+    monkeypatch.setattr(repo, "find_package", lambda p, **kw: (*real(p)[:2], "cargo", real(p)[3]))
+    lines = []
     out = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/alpha"]),
-                               cfg, lambda m: None))
+                       cfg, lines.append))
     assert offline["matrix"] == []
     assert {r.status for r in out.results} == {"unverified"}
+    assert any("no verification lane for cargo" in line for line in lines)
+
+
+def test_a_named_package_on_a_repo_without_metadata_takes_the_chosen_ecosystem(
+        offline, cfg, monkeypatch, tmp_path):
+    import docrot.acquire.repo as repo
+    _as_npm(monkeypatch)
+    docs_only = tmp_path / "cli"
+    docs_only.mkdir()
+    (docs_only / "README.md").write_text("# docs\n")
+    monkeypatch.setattr(repo, "clone", lambda r, log, timeout=600: (docs_only, "abc123", "main"))
+    monkeypatch.setattr(repo, "find_package", lambda p, **kw: ("", "", "pypi", p))
+    out = run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/cli"],
+                                  packages=["my-cli"], options=ScanOptions(ecosystem="npm")),
+                       cfg, lambda m: None))
+    [t] = out.report["packages"]
+    assert (t["package"], t["ecosystem"]) == ("my-cli", "npm")
+    assert offline["matrix"] == []                      # never verified as a PyPI package
+
+
+def test_a_repo_less_npm_package_keeps_its_name_as_the_import(offline, cfg, monkeypatch):
+    seen = {}
+    import docrot.extract as extract_pkg
+    real = extract_pkg.extract
+
+    def spy(pages, targets, *a, **kw):
+        seen.update({t.package: t.import_name for t in targets})
+        return real(pages, targets, *a, **kw)
+
+    monkeypatch.setattr(extract_pkg, "extract", spy)
+    _as_npm(monkeypatch)
+    run(run_scan(ScanInputs(docs=["https://a.io"], packages=["my-cli"],
+                            options=ScanOptions(ecosystem="npm")), cfg, lambda m: None))
+    assert seen == {"my-cli": "my-cli"}
+
+
+def test_the_missing_package_message_names_both_the_field_and_the_flag(offline, cfg):
+    with pytest.raises(ScanError) as e:
+        run(run_scan(ScanInputs(docs=["https://a.io"]), cfg, lambda m: None))
+    assert "package field" in str(e.value) and "--package" in str(e.value)
+
+
+def test_npm_versions_are_spread_across_major_lines(offline, cfg, monkeypatch):
+    """The newest three of a package that ships daily are three near-identical
+    patches; the newest of each major line is where the docs have rotted."""
+    import docrot.acquire as acq
+    npm_calls = _as_npm(monkeypatch)
+    labels = ["1.0.0", "1.0.1", "2.0.0", "2.0.1", "3.0.0", "3.0.1"]
+    monkeypatch.setattr(acq, "releases", lambda p, e: [Release(label=v, released_at="2026-01-01")
+                                                       for v in labels])
+    run(run_scan(ScanInputs(docs=["https://a.io"], repos=["https://github.com/o/alpha"],
+                            options=ScanOptions(versions=3)), cfg, lambda m: None))
+    assert npm_calls[0][2] == ["1.0.1", "2.0.1", "3.0.1"]
 
 
 def test_execute_scan_records_a_run(store, cfg):

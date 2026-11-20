@@ -75,6 +75,22 @@ def test_new_scan_with_several_sources_runs_to_a_report(page: Page, dashboard):
     expect(page.locator("#sub")).to_contain_text("beta")
 
 
+def test_new_scan_sends_packages_aligned_with_repos(page: Page, dashboard):
+    page.goto(dashboard.url)
+    page.locator(".toolbar [data-new]").click()
+    dialog = page.locator("#dlg")
+    page.get_by_role("textbox", name="Docs URL 1", exact=True).fill(DOCS[0])
+    page.get_by_role("textbox", name="Repository 1", exact=True).fill(REPOS[0])
+    dialog.get_by_role("button", name="+ Add another repo").click()
+    page.get_by_role("textbox", name="Repository 2", exact=True).fill(REPOS[1])
+    page.get_by_role("textbox", name="Package for repository 2", exact=True).fill("pkg-b")
+    dialog.get_by_role("button", name="+ Add a package without a repo").click()
+    page.get_by_role("textbox", name="Package without a repo 1", exact=True).fill("pkg-c")
+    dialog.get_by_role("button", name="Start scan").click()
+    expect(dialog).to_be_hidden()
+    assert [r.packages for r in dashboard.store.all()] == [["", "pkg-b", "pkg-c"]]
+
+
 def test_detail_view_navigation(page: Page, dashboard):
     seed(dashboard)
     page.goto(dashboard.url)
@@ -245,3 +261,36 @@ def test_an_imported_file_cannot_run_script_in_the_dashboard(page: Page, dashboa
     assert page.evaluate("window.__pwned") is None            # nothing executed
     assert "<img" not in page.evaluate("document.getElementById('findDesc').innerHTML")
     expect(page.locator("#findDesc")).to_contain_text(payload)  # shown as the text it is
+
+
+def test_settings_are_saved_to_the_keychain_and_never_shown_back(page: Page, dashboard, keychain):
+    page.goto(dashboard.url)
+    page.get_by_role("link", name="Settings").click()
+    expect(page.locator("#setBackend")).to_have_text("stored in memory")
+
+    key = page.get_by_label(re.compile("^Daytona API key"))
+    expect(key).to_have_attribute("type", "password")
+    key.fill("dtn-secret")
+    page.locator("#setForm").get_by_label(re.compile("^Max pages per site")).fill("12")
+    page.get_by_role("button", name="+ Add a credential").click()
+    page.get_by_label("New credential 1 name").fill("openai_api_key")
+    page.get_by_label("New credential 1 value").fill("sk-secret")
+    page.get_by_role("button", name="Save settings").click()
+
+    expect(page.locator("#setSaved")).to_contain_text("Saved to the keychain")
+    assert json.loads(keychain.text) == {"DAYTONA_API_KEY": "dtn-secret", "DOCROT_MAX_PAGES": "12",
+                                         "SANDBOX_ENV_OPENAI_API_KEY": "sk-secret"}
+    # the page is rebuilt from the server's answer, which carries no secret
+    expect(page.get_by_label(re.compile("^Daytona API key"))).to_have_value("")
+    expect(page.locator("#setForm").get_by_label(re.compile("^Max pages per site"))).to_have_value("12")
+    assert "secret" not in page.content()
+
+    row = page.locator('[data-row="SANDBOX_ENV_OPENAI_API_KEY"]')
+    row.get_by_role("button", name="Remove").click()
+    page.get_by_role("button", name="Save settings").click()
+    expect(row).to_have_count(0)
+    assert "SANDBOX_ENV_OPENAI_API_KEY" not in json.loads(keychain.text)
+
+    page.get_by_role("link", name=re.compile("All scans")).click()
+    expect(page.locator("#viewList")).to_be_visible()
+    expect(page.locator("#viewSettings")).to_be_hidden()
