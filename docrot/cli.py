@@ -6,6 +6,7 @@
     docrot blast SYMBOL [--scan ID]
     docrot diff [--scan ID] [--since RUN]
     docrot export [--scan ID] [--run RUN] [--format jsonl|sarif] [-o FILE]
+    docrot mcp                      # MCP server on stdio, for other AI agents
 
 Every scan is recorded in data/scans/, the same store the dashboard reads, so a
 scan started here shows up there and vice versa.
@@ -29,11 +30,11 @@ def log(msg: str = ""):
     console.print(msg, highlight=False, markup=False)
 
 
-def open_store() -> Store:
+def open_store(say=log) -> Store:
     store = Store(cfgmod.DATA)
     adopted = store.import_legacy(cfgmod.RUNS)
     if adopted:
-        log(f"  adopted data/runs/ as scan {adopted.id} ({adopted.name})")
+        say(f"  adopted data/runs/ as scan {adopted.id} ({adopted.name})")
     return store
 
 
@@ -69,6 +70,7 @@ def scan(args) -> int:
             console.print(f"[red]{problem}[/red]")
         return 2
 
+    store.recover()        # a crashed scan's leftover status is not "also running"
     busy = [r.name for r in store.all()
             if r.id != rec.id and store.status(r.id).state == "running"]
     if busy:
@@ -127,6 +129,21 @@ def list_scans(args) -> int:
 def serve_cmd(args) -> int:
     from .server import serve
     serve(open_store(), args.port, open_browser=not args.no_open)
+    return 0
+
+
+def mcp_cmd(args) -> int:
+    """The MCP server on stdio. stdout is the protocol channel, so even the
+    one-time legacy-import notice open_store prints goes to stderr here."""
+    import contextlib
+
+    from .mcp_server import say, serve_stdio
+
+    # Before the server starts nothing guards fd 1 yet (the SDK diverts it to
+    # stderr only while serving), so setup output is redirected by hand.
+    with contextlib.redirect_stdout(sys.stderr):
+        store = open_store(say)
+    serve_stdio(store)
     return 0
 
 
@@ -268,6 +285,8 @@ def parser() -> argparse.ArgumentParser:
     df.add_argument("--scan", help="scan id (default: the most recently run)")
     df.add_argument("--since", help="run id to compare against, e.g. 20260912T101500")
 
+    sub.add_parser("mcp", help="MCP server on stdio, so other AI agents can run scans and read findings")
+
     ex = sub.add_parser("export", help="a run as JSON Lines, for agents and scripts")
     ex.add_argument("--scan", help="scan id (default: the most recently run)")
     ex.add_argument("--run", help="run id (default: the newest)")
@@ -294,6 +313,8 @@ def main(argv=None) -> int:
         return serve_cmd(args)
     if args.cmd == "export":
         return export_cmd(args)
+    if args.cmd == "mcp":
+        return mcp_cmd(args)
     return blast(args)
 
 

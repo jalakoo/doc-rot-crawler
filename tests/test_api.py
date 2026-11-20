@@ -198,3 +198,14 @@ def test_docs_and_a_bare_package_are_accepted(client):
     r = client.post("/api/scans", json={"docs": ["https://docs.a.io"], "packages": ["only-pkg"]})
     assert r.status_code == 201 and r.json()["packages"] == ["only-pkg"]
     client.worker.join()
+
+
+def test_a_scan_stuck_running_from_a_dead_process_can_be_run_again(client, store):
+    scan = client.post("/api/scans", json=BODY).json()
+    client.worker.join()
+    # a status as an older docrot, or a crashed process, left it
+    store._write(store._dir(scan["id"]) / "status.json",
+                 {"state": "running", "phase": 2, "log": []})
+    assert client.post(f"/api/scans/{scan['id']}/runs").status_code == 202
+    client.worker.join()
+    assert store.status(scan["id"]).state == "done"

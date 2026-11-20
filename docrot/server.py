@@ -285,7 +285,7 @@ def serve(store: Store, port: int = 8080, open_browser: bool = True,
     stuck = store.recover()
     worker = ScanWorker(store, lambda s, scan_id: execute_scan(s, scan_id))
     for scan_id in stuck:
-        print(f"  ! {scan_id} was interrupted by the last shutdown - marked failed")
+        print(f"  ! {scan_id} was left running by a process that is gone - marked failed")
     url = dashboard_url(port, path)
     print(f"\n  dashboard:  {url}\n  ctrl-c to stop\n")
     if open_browser:

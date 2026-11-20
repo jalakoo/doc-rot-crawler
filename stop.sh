@@ -6,8 +6,8 @@
 #
 # Stops each `docrot serve` started from this directory (and the start.sh
 # wrapping it), kills git left behind by a scan, removes partial clones, and
-# marks interrupted scans failed so the dashboard does not show a scan running
-# forever.
+# marks scans whose process is gone as failed so none shows running forever
+# (a scan another live docrot process is running is left alone).
 #
 # Deliberately not `set -e`: every step is best-effort cleanup, and one failure
 # must not leave the rest undone.
@@ -87,8 +87,12 @@ if [[ "$ALL_CACHE" == 1 && -d data/cache ]]; then
   rm -rf data/cache
 fi
 
-# A scan that was running when the server stopped is not running now.
+# A scan whose process was just stopped is not running now. recover() fails only
+# scans whose owner process is gone, so a CLI or MCP scan still running is left
+# alone. Give the processes stopped above a moment to leave the process table:
+# a not-yet-reaped one still looks alive.
 if [[ -x .venv/bin/python ]]; then
+  [[ -n "${servers// /}${wrappers// /}" ]] && sleep 1
   .venv/bin/python - <<'PY'
 from docrot import config
 from docrot.store import Store

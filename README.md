@@ -19,6 +19,7 @@ Above: 153 pages of the Pydantic docs checked against `pydantic` and
   - [SARIF, for CI and code scanning](#sarif-for-ci-and-code-scanning)
   - [Importing a run](#importing-a-run)
   - [Using it](#using-it)
+- [MCP server](#mcp-server)
 - [Develop](#develop)
 - [Security](#security)
 
@@ -32,8 +33,9 @@ docker compose up -d          # optional: Neo4j for `docrot blast` traversals
 ```
 
 `stop.sh` stops every dashboard started from this directory, kills git left
-behind by a scan, deletes partial clones, and marks interrupted scans failed so
-none is left showing as running. `--all-cache` also empties `data/cache`, which
+behind by a scan, deletes partial clones, and marks scans whose process is gone
+as failed so none is left showing as running (a scan still running in another
+docrot process, such as an agent's, is left alone). `--all-cache` also empties `data/cache`, which
 costs the next scan a fresh clone and crawl.
 
 Add scans from the dashboard's **New scan** dialog, or from the CLI. A scan can
@@ -54,6 +56,7 @@ docrot scans                  # what's recorded
 docrot diff [--scan ID]       # regressions since the previous run; exit 1 if any (cron)
 docrot blast close_async      # pages that break if a symbol is renamed
 docrot export [--scan ID]     # findings as JSON Lines or SARIF - see below
+docrot mcp                    # scan and read findings as MCP tools for other agents
 ```
 
 Scans started from either place land in `data/scans/` and show up in both. The
@@ -166,6 +169,7 @@ The diagram is generated: edit `images/architecture-flowchart.html` and run
 | **.NET SDK 10 + Roslyn** (in the sandbox image) | Reflecting a NuGet package's API and compiling C# snippets against it | C# snippets are `unverified` |
 | **git** ≥ 2.27 | Cloning repos: `--depth 1 --filter=blob:none` plus sparse checkout of code, docs and package metadata | No repo docs, no HEAD symbol table |
 | **Neo4j 5** (`neo4j` driver, `docker-compose.yml`) | `docrot blast`, drift traversals; Symbol/Page/Snippet/Version graph | Blast radius falls back to the report's own index |
+| **mcp** (official MCP Python SDK) | `docrot mcp`: the tools other AI agents call, over stdio | CLI and dashboard only |
 | **FastAPI + uvicorn** | The dashboard's API and static files, bound to 127.0.0.1 | CLI only |
 | **httpx** | Every HTTP fetch, with a disk cache under `data/cache` | — |
 | **mistune** | Parsing code fences out of markdown, with exact line numbers | — |
@@ -317,6 +321,66 @@ actual behaviour, where to edit, and a `fix_hint`. After the docs are changed,
 re-run the scan from the dashboard or `docrot scan`, and check that the ids are
 gone.
 
+## MCP server
+
+`docrot mcp` serves docrot to other AI agents over the Model Context Protocol, so an
+agent can start a scan, wait for it, and then work through the findings without anyone
+copying files around. It reads and writes the same `data/scans/` store as the CLI and the
+dashboard: a scan an agent starts shows up in `docrot scans` and on the dashboard.
+
+| Tool | |
+| --- | --- |
+| `list_scans` | every scan: id, name, sources, state, last run and its headline counts. Start here |
+| `get_scan` | one scan's state, current phase, error, last 20 log lines and run history. What an agent polls after starting a scan |
+| `get_findings` | a run's findings in the [JSON Lines record shape](#records), filtered by `kinds` or `page_contains`, paged with `limit` and `offset`, with a total |
+| `scan_diff` | what got worse or better since the previous run, as `docrot diff` reports it |
+| `rename_impact` | which pages break if a symbol is renamed. Answered from the scan's own index, so it needs no Neo4j; the result says whether the report or the graph answered |
+| `start_scan` | queue a scan of docs against repos and packages, and return at once. Runs for minutes and spends sandbox time and model credit. Reuses the scan with the same sources, as the CLI does |
+| `rerun_scan` | queue another run of an existing scan |
+
+The first five only read the store and cost nothing. `start_scan` takes `packages` the way
+`--package` does: by position with `repos`, a blank keeping a repo's slot, and names past the
+last repo being packages that need no repo. Results are small on purpose, since an agent pays
+for every token: no full logs, and findings come a page at a time. An unknown scan id is
+answered with the ids that exist, and validation messages are the dashboard's own.
+
+Register it with Claude Code, using the absolute path to this checkout's virtualenv:
+
+```bash
+claude mcp add docrot -- /absolute/path/to/doc-rot-detector/.venv/bin/docrot mcp
+```
+
+Other clients take the same command in their config, usually under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "docrot": {
+      "command": "/absolute/path/to/doc-rot-detector/.venv/bin/docrot",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**One scan at a time, across processes.** Every scan ends by sweeping all live sandboxes
+in the account, so two scans at once delete each other's sandboxes. Inside the MCP server a
+second scan waits its turn in the queue, like on the dashboard. But the store is shared, so
+`start_scan` and `rerun_scan` are also refused, naming the scan, while any scan is queued or
+running that this server did not start: the dashboard, `docrot scan` or another agent's
+server. Every queued or running scan records the process that owns it (pid and host), so
+a scan left behind by a crashed process does not block anything: when the MCP server
+starts, and before each start, it marks scans whose owner has exited as failed. The same
+goes for `docrot serve` at startup, `./stop.sh`, and re-running such a scan from the
+dashboard. Starting the dashboard no longer fails a scan an agent or the CLI is running.
+Ownership can only be checked on the machine that holds the process: a scan owned by another
+host is never failed automatically, and a scan with no recorded owner (from before this was
+tracked) is treated as dead. Known limit: if a dead owner's pid is reused by an unrelated
+process, its scan looks alive until that process exits. When the MCP server stops, scans it
+was running or had queued are marked failed.
+
+On stdio, stdout carries only protocol frames. Everything else the server says goes to stderr.
+
 ## Settings
 
 The dashboard's **Settings** page (`#/settings`) edits the same options as `.env` - API keys,
@@ -345,6 +409,14 @@ is escaped. Documentation code is only ever executed in a Daytona sandbox,
 never on your machine - and so is the NuGet restore and compile of a .NET
 package, whose build targets can run code of their own.
 
+`docrot mcp` has no network listener: it speaks stdio to the one process that launched it, so
+whoever can launch it can use it. Its tools can start sandboxes and spend API credit on an
+agent's say-so, so register it only with agents you would let run `docrot scan`. A repo may be
+a local path, exactly as on the CLI, so `start_scan` lets an agent point a scan at any directory
+on this machine; the code is only read, and still executed only in a sandbox. No tool takes or
+returns a credential or a setting, and none reads a file you did not name as a source. Keys stay
+in `.env` and the keychain.
+
 Credentials live in `.env` - `chmod 600` it. `SANDBOX_ENV_*` values are
 forwarded into third-party sandboxes so snippets can run, and everything a
 sandbox prints is redacted before it is stored. `docker-compose.yml` publishes
@@ -370,5 +442,6 @@ make test-graph  # against the local Neo4j - wipes its graph
 | `docrot/store.py` | scans, status and run history as JSON under `data/scans/` |
 | `docrot/report/export.py`, `sarif.py`, `ingest.py` | the exports above, and reading them back in |
 | `docrot/server.py`, `worker.py` | dashboard API and the serial scan queue |
+| `docrot/mcp_server.py` | the MCP tools for other agents (`docrot mcp`) |
 | `docrot/ui/` | the dashboard - no build step; `lib.js` holds the unit-tested logic |
 | `tests/fakes.py` | real reports from synthetic inputs, so no test touches the network |

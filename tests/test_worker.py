@@ -57,3 +57,27 @@ def test_worker_survives_an_executor_exception(store):
     worker.enqueue(rec2.id)                    # still alive
     worker.join()
     worker.stop()
+
+
+def test_enqueue_refuses_a_scan_a_live_other_process_is_running(store):
+    import os
+    import socket
+    import subprocess
+    import sys
+
+    from docrot.store import ScanStatus
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        worker = ScanWorker(store, lambda s, i: None)
+        rec = store.create(["https://docs.a.io"], [])
+        store.set_status(rec.id, ScanStatus(state="running", pid=proc.pid, host=socket.gethostname()))
+        with pytest.raises(AlreadyActive):
+            worker.enqueue(rec.id)
+        proc.kill()
+        proc.wait()
+        assert worker.enqueue(rec.id).pid == os.getpid()     # its owner died: re-running is allowed
+        worker.join()
+        worker.stop()
+    finally:
+        proc.kill()

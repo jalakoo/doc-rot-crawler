@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
+import sys
 
 import pytest
 
@@ -113,15 +117,80 @@ def test_run_ids_are_unique_and_history_is_capped(store):
     assert len({r.id for r in runs}) == KEEP_RUNS
 
 
-def test_recover_marks_orphaned_scans_failed(store):
+def write_status(store, scan_id, **fields):
+    """A status exactly as written, bypassing set_status's owner stamp - the way
+    a status from an older docrot, another host or a dead process looks on disk."""
+    store._write(store._dir(scan_id) / "status.json", ScanStatus(**fields).model_dump())
+
+
+@pytest.fixture
+def foreign():
+    """A real process that is not us, killed on teardown."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    yield proc
+    proc.kill()
+    proc.wait()
+
+
+def test_recover_fails_scans_with_no_recorded_owner(store):
+    # changed from test_recover_marks_orphaned_scans_failed: set_status now stamps
+    # an owner, so the old-format status this test is about is written raw
     a = store.create(["https://a.io"], [])
     b = store.create(["https://b.io"], [])
-    store.set_status(a.id, ScanStatus(state="running"))
+    write_status(store, a.id, state="running")
     store.set_status(b.id, ScanStatus(state="done"))
     assert store.recover() == [a.id]
     assert store.status(a.id).state == "failed"
     assert "Interrupted" in store.status(a.id).error
     assert store.status(b.id).state == "done"
+
+
+def test_recover_leaves_a_scan_owned_by_a_live_other_process_alone_until_it_dies(store, foreign):
+    rec = store.create(["https://a.io"], [])
+    store.set_status(rec.id, ScanStatus(state="running", pid=foreign.pid, host=socket.gethostname()))
+    assert store.recover() == []
+    assert store.status(rec.id).state == "running" and store.is_active(rec.id)
+    foreign.kill()
+    foreign.wait()
+    assert not store.is_active(rec.id)
+    assert store.recover() == [rec.id]
+    assert store.status(rec.id).state == "failed"
+
+
+def test_recover_never_fails_the_callers_own_scan(store):
+    rec = store.create(["https://a.io"], [])
+    store.set_status(rec.id, ScanStatus(state="running"))
+    st = store.status(rec.id)
+    assert (st.pid, st.host) == (os.getpid(), socket.gethostname())
+    assert store.recover() == [] and store.status(rec.id).state == "running"
+
+
+def test_recover_leaves_another_hosts_scan_alone(store):
+    rec = store.create(["https://a.io"], [])
+    dead_pid = 2 ** 22 + 12345            # no such process here, but this is not here
+    store.set_status(rec.id, ScanStatus(state="queued", pid=dead_pid, host="some-other-host"))
+    assert store.recover() == [] and store.status(rec.id).state == "queued"
+
+
+def test_queued_and_running_statuses_keep_their_owner_through_updates(store):
+    rec = store.create(["https://a.io"], [])
+    st = ScanStatus(state="queued")
+    store.set_status(rec.id, st)
+    st.state = "running"
+    st.log.append(["t-sys", "x"])
+    store.set_status(rec.id, st)
+    assert store.status(rec.id).pid == os.getpid()
+    store.set_status(rec.id, ScanStatus(state="done"))
+    assert store.status(rec.id).pid is None          # nothing to own once finished
+
+
+def test_a_status_file_from_before_owners_still_loads(store):
+    rec = store.create(["https://a.io"], [])
+    path = store._dir(rec.id) / "status.json"
+    path.write_text(json.dumps({"state": "done", "phase": 5, "queued_at": "", "started_at": "",
+                                "finished_at": "t", "error": "", "log": []}))
+    st = store.status(rec.id)
+    assert st.state == "done" and st.pid is None and st.host == ""
 
 
 def _legacy_run(d, generated_at, findings):

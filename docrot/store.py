@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import threading
 from pathlib import Path
 from typing import Literal
@@ -69,6 +70,49 @@ class ScanStatus(BaseModel):
     finished_at: str = ""
     error: str = ""
     log: list[list[str]] = Field(default_factory=list)   # [style, message]
+    # The process that queued or is running this scan, stamped by
+    # `Store.set_status`. Absent (None, "") in a status written before owners
+    # were recorded.
+    pid: int | None = None
+    host: str = ""
+
+
+ACTIVE = ("queued", "running")
+
+
+def pid_alive(pid: int) -> bool:
+    """Is there a process with this pid on this host?
+
+    Known limit: pids are reused. If a dead owner's pid is taken by an unrelated
+    process, its scan looks alive until that process exits; nothing here can tell
+    the two apart without a start time, which a status file does not carry."""
+    if pid <= 0:            # kill(0) and kill(-n) signal process groups, not a pid
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:     # it exists, it is just someone else's
+        return True
+    except OSError:             # cannot tell: do not fail a scan on a guess
+        return True
+    return True
+
+
+def owner_gone(st: ScanStatus) -> bool:
+    """Is the process behind this queued or running status provably gone?
+
+    True for a status with no recorded owner (written before owners were
+    recorded: nothing else can be known) and for one owned by another process on
+    this host that no longer exists. False for the calling process itself, for a
+    live process, and for another host, whose processes cannot be checked."""
+    if st.pid is None:
+        return True
+    if st.host != socket.gethostname():
+        return False
+    if st.pid == os.getpid():
+        return False
+    return not pid_alive(st.pid)
 
 
 class RunSummary(BaseModel):
@@ -273,21 +317,36 @@ class Store:
         return ScanStatus.model_validate(data) if data else ScanStatus()
 
     def set_status(self, scan_id: str, status: ScanStatus) -> None:
+        """Write a status. A queued or running one is stamped with this process
+        as its owner (unless it already names one), so no caller can forget and
+        the stamp survives the updates a running scan makes to the same object."""
+        if status.state in ACTIVE and status.pid is None:
+            status.pid, status.host = os.getpid(), socket.gethostname()
         with self._lock:
             self._write(self._dir(scan_id) / "status.json", status.model_dump())
 
-    def recover(self) -> list[str]:
-        """Scans left queued or running by a process that is gone.
+    def is_active(self, scan_id: str) -> bool:
+        """Queued or running in a process that is still there."""
+        st = self.status(scan_id)
+        return st.state in ACTIVE and not owner_gone(st)
 
-        Called when the server starts: nothing else is working on them, so
-        leaving them `running` would show a spinner forever."""
+    def recover(self) -> list[str]:
+        """Fail scans left queued or running by a process that is gone.
+
+        Safe to call from any docrot process: a scan owned by a live process,
+        by this one, or by another host is left alone (see `owner_gone`). The
+        store is shared by the dashboard, the CLI and the MCP server, so the
+        old "fail everything at startup" would kill a scan someone else is
+        running. Returns the ids it failed."""
         stuck = []
         for rec in self.all():
-            st = self.status(rec.id)
-            if st.state in ("queued", "running"):
+            with self._lock:
+                st = self.status(rec.id)
+                if st.state not in ACTIVE or not owner_gone(st):
+                    continue
                 st.state, st.finished_at = "failed", now()
-                st.error = "Interrupted — the server stopped before this scan finished."
-                st.log.append(["t-hit", "! interrupted: the server stopped"])
+                st.error = "Interrupted - the process running this scan stopped before it finished."
+                st.log.append(["t-hit", "! interrupted: the process running this scan stopped"])
                 self.set_status(rec.id, st)
                 stuck.append(rec.id)
         return stuck
